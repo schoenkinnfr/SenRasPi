@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+preview/
+*.png
+!docs/*.png
+.DS_Store
+
+# Never commit a paired credential. The token in here reaches glucose data
+# for whoever paired it, and a public repo is exactly the wrong place for it.
+display.json
+*.token
+
+# Scratch dir for files moved aside (this environment cannot delete).
+_to_delete/

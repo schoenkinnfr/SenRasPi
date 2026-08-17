@@ -1,0 +1,41 @@
+[Unit]
+Description=Sentinelle T1D glucose display
+Documentation=https://github.com/schoenkinnfr/SenRasPi
+# Wants= rather than Requires=: the display should come up and show its
+# "waiting for the first reading" screen even with no network, not sit dark.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=spi gpio video
+ExecStart=/opt/sentinelle-display/bin/sentinelle-display run
+Restart=always
+RestartSec=5
+# A crash loop must not fill the SD card with journal. Cards are the usual
+# cause of a Pi that dies after three months; writes are the usual cause of a
+# dead card.
+StandardOutput=journal
+StandardError=journal
+
+# It reads one JSON file and writes to a display. Nothing else is needed.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pi/.config/sentinelle /tmp
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+# /dev/fb*, /dev/spidev* and /dev/gpiochip* are the only devices it touches.
+DeviceAllow=char-spi rw
+DeviceAllow=char-gpiochip rw
+DeviceAllow=/dev/fb0 rw
+DeviceAllow=/dev/fb1 rw
+
+[Install]
+WantedBy=multi-user.target
+
+# Reference copy. install.sh writes this file with your actual user and venv
+# path substituted in; edit that script rather than this if you change either.

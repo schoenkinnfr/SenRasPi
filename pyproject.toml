@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinelle-pi-display"
+version = "1.0.0"
+description = "Always-on glucose display for a Raspberry Pi with a small SPI TFT panel"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "Nathan Schoenkin" }]
+keywords = ["diabetes", "cgm", "raspberry-pi", "display", "spi", "tft"]
+classifiers = [
+  "Environment :: No Input/Output (Daemon)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+
+# Pillow and numpy only. Everything else the display needs is in the standard
+# library, and on a Pi both of these come from apt (python3-pil, python3-numpy)
+# rather than being built from source — see install.sh.
+dependencies = ["Pillow>=9.0", "numpy>=1.21"]
+
+[project.optional-dependencies]
+# Only needed for the direct-SPI backend. Omit them and the framebuffer and
+# PNG backends still work, which is what lets this run on a laptop.
+spi = ["spidev>=3.5", "gpiozero>=2.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+sentinelle-display = "sentinelle_display.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/schoenkinnfr/SenRasPi"
+
+[tool.setuptools.packages.find]
+include = ["sentinelle_display*"]
