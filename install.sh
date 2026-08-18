@@ -120,7 +120,12 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 say "Installing the systemd service"
 
-sudo tee "$SERVICE" >/dev/null <<UNIT
+# The delimiter is QUOTED, so the shell expands nothing inside this block.
+# That is deliberate: an earlier version used an unquoted heredoc and a
+# pair of backticks in a comment turned into command substitution, which
+# silently ran an interactive command and hung the installer. The two real
+# substitutions happen with sed on the next line.
+sudo tee "$SERVICE" >/dev/null <<'UNIT'
 [Unit]
 Description=Sentinelle T1D glucose display
 Documentation=https://github.com/schoenkinnfr/SenRasPi
@@ -131,9 +136,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=${RUN_USER}
+User=__RUN_USER__
 SupplementaryGroups=spi gpio video
-ExecStart=${VENV}/bin/sentinelle-display run
+ExecStart=__VENV__/bin/sentinelle-display run
 Restart=always
 RestartSec=5
 # A crash loop must not fill the SD card with journal. Cards are the usual
@@ -149,7 +154,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 # The leading '-' matters. Without it systemd refuses to start the unit at
 # all when this directory does not exist yet -- i.e. on every fresh install,
-# before the first `sentinelle-display pair`. The failure is a cryptic
+# before the first 'sentinelle-display pair'. The failure is a cryptic
 # "Failed to set up mount namespacing ... status=226/NAMESPACE" that never
 # reaches the program, so the display crash-loops instead of showing its
 # "not paired yet" screen, which is the exact situation that screen exists
@@ -157,7 +162,7 @@ ProtectHome=read-only
 # someone deleting it.
 # /tmp is not listed: PrivateTmp=yes already gives this unit its own writable
 # /tmp, and naming it here would only re-expose the host's.
-ReadWritePaths=-/home/${RUN_USER}/.config/sentinelle
+ReadWritePaths=-/home/__RUN_USER__/.config/sentinelle
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
@@ -170,6 +175,7 @@ DeviceAllow=/dev/fb1 rw
 [Install]
 WantedBy=multi-user.target
 UNIT
+sudo sed -i "s|__RUN_USER__|${RUN_USER}|g; s|__VENV__|${VENV}|g" "$SERVICE"
 
 sudo systemctl daemon-reload
 sudo systemctl enable sentinelle-display >/dev/null

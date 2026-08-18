@@ -319,6 +319,64 @@ def _draw_rail(draw, lay: Layout, pal: Palette, cfg, d: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trend. Two pure functions first, because they carry the decisions worth
+# testing and testing them through rendered pixels is both brittle and a poor
+# description of what is supposed to happen.
+
+Point = tuple[float, float]  # (epoch milliseconds, mg/dL)
+
+
+def trend_window(
+    points: list[Point], now_ms: float, hours: float
+) -> tuple[float, float, list[Point]]:
+    """Returns (t_start, t_end, points inside that window).
+
+    The window ends at the NEWEST READING, not at wall-clock now. If the
+    server is running an hour behind, anchoring to now would slide the whole
+    curve off the left of the plot and leave an empty panel sitting next to a
+    glucose number that is visibly present — which reads as a rendering bug
+    rather than as late data. The "N min ago" in the footer is what reports
+    the lag.
+
+    The floor stops that from going too far the other way: if the newest
+    reading is ancient, the window still covers the recent past rather than
+    drifting off to wherever the data stops, so an empty plot means "nothing
+    recently" rather than "here is a detailed view of last Tuesday".
+
+    Points outside the window are DROPPED, not clamped. Clamping stacks every
+    out-of-window reading into one vertical smear at the left edge that looks
+    exactly like a real excursion.
+    """
+    span_ms = hours * 3600 * 1000
+    t_end = max((t for t, _ in points), default=now_ms)
+    t_end = max(t_end, now_ms - span_ms / 2)
+    t_start = t_end - span_ms
+    return t_start, t_end, [(t, v) for t, v in points if t_start <= t <= t_end]
+
+
+def split_on_gaps(points: list[Point], gap_minutes: float = GAP_MINUTES) -> list[list[Point]]:
+    """Splits a series wherever readings stop for longer than `gap_minutes`.
+
+    Drawing one continuous line through a two-hour sensor outage implies
+    readings that were never received — the eye reads a straight segment as
+    measurement, not as absence. Each run of contiguous readings becomes its
+    own polyline instead.
+
+    Returns [] for an empty input rather than [[]], so callers can iterate
+    without a special case.
+    """
+    if not points:
+        return []
+    gap_ms = gap_minutes * 60_000
+    segments: list[list[Point]] = [[points[0]]]
+    for prev, cur in zip(points, points[1:]):
+        if cur[0] - prev[0] > gap_ms:
+            segments.append([])
+        segments[-1].append(cur)
+    return segments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Trend. Target band first, then the line on top of it.
 
 
@@ -335,20 +393,8 @@ def _draw_trend(draw, lay: Layout, pal: Palette, cfg, d: dict, now: float) -> No
     gutter = lay.px(30)
     xp1 = x1 - gutter
 
-    # The window ends at the newest reading, not at wall-clock now. If the
-    # server is an hour behind, anchoring to now would slide the whole curve
-    # off the left of the plot and leave an empty panel next to a number that
-    # is visibly present — which reads as a rendering bug rather than as late
-    # data. The "N min ago" in the footer is what tells you about the lag.
     all_pts = [(float(p["t"]), float(p["sg"])) for p in series if p.get("sg") is not None]
-    t_end = max((t for t, _ in all_pts), default=now * 1000)
-    t_end = max(t_end, now * 1000 - hours * 3600 * 1000 / 2)
-    t_start = t_end - hours * 3600 * 1000
-
-    # Drop points outside the window rather than clamping them onto the edge:
-    # clamping stacks every out-of-window reading into one vertical smear at
-    # x0 that looks like a real excursion.
-    pts = [(t, v) for t, v in all_pts if t_start <= t <= t_end]
+    t_start, t_end, pts = trend_window(all_pts, now * 1000, hours)
 
     # A mostly fixed y-window keeps the shape of the curve comparable between
     # glances. An autoscaled axis makes a flat night look like a rollercoaster.
@@ -379,14 +425,7 @@ def _draw_trend(draw, lay: Layout, pal: Palette, cfg, d: dict, now: float) -> No
               font("regular", lay.pt(13)), pal.ink_3, anchor="mm")
         return
 
-    # Break the line across gaps rather than interpolating through them.
-    segments: list[list[tuple[float, float]]] = [[]]
-    prev_t = None
-    for t, v in pts:
-        if prev_t is not None and (t - prev_t) > GAP_MINUTES * 60_000:
-            segments.append([])
-        segments[-1].append((sx(t), sy(v)))
-        prev_t = t
+    segments = [[(sx(t), sy(v)) for t, v in seg] for seg in split_on_gaps(pts)]
 
     for seg in segments:
         if len(seg) >= 2:
@@ -554,10 +593,17 @@ def _dashed_h(draw, x0: int, x1: int, y: float, colour, width: int, dash: int = 
         x += dash * 2
 
 
-def demo_snapshot(kind: str = "in_range") -> Snapshot:
+def demo_snapshot(kind: str = "in_range", now: float | None = None) -> Snapshot:
     """Canned data for `preview` and for the tests. Shaped exactly like
-    /kiosk/data so a preview that looks right predicts a Pi that looks right."""
-    now_ms = time.time() * 1000
+    /kiosk/data so a preview that looks right predicts a Pi that looks right.
+
+    `now` anchors the fake series. It MUST be the same value the caller then
+    passes to render(): the trend window is computed from wall-clock now, so
+    a preview that renders at a pretend 14:47 against a series built from the
+    real clock produces "no readings in this window" — a correct answer to
+    the wrong question, and one that looks exactly like a broken program.
+    """
+    now_ms = (now if now is not None else time.time()) * 1000
     base = {"in_range": 142, "low": 58, "high": 244, "stale": 131}[kind]
     series = []
     for i in range(36):

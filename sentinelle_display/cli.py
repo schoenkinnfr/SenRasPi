@@ -16,6 +16,7 @@ credential. Everything else works from the config file it produces.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -294,12 +295,15 @@ def cmd_preview(args) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     # Fixed mid-afternoon timestamp so night mode does not surprise whoever
-    # runs this at 11pm and thinks the layout broke.
+    # runs this at 11pm and thinks the layout broke. The SAME value goes to
+    # demo_snapshot, so the fake readings land inside the window this fake
+    # clock implies -- otherwise every preview run before 14:47 local draws
+    # "no readings in this window".
     import datetime
     when = datetime.datetime.now().replace(hour=14, minute=47, second=0).timestamp()
 
     for kind in ("in_range", "low", "high", "stale"):
-        img = renderer.render(cfg, renderer.demo_snapshot(kind), now=when)
+        img = renderer.render(cfg, renderer.demo_snapshot(kind, now=when), now=when)
         path = out / f"{kind}.png"
         img.save(path)
         _say(f"  {path}  {img.size[0]}x{img.size[1]}")
@@ -307,7 +311,7 @@ def cmd_preview(args) -> int:
     night_cfg = configmod.load()
     _apply_overrides(night_cfg, args)
     night_cfg.night = "0-23"
-    img = renderer.render(night_cfg, renderer.demo_snapshot("in_range"), now=when)
+    img = renderer.render(night_cfg, renderer.demo_snapshot("in_range", now=when), now=when)
     img.save(out / "night.png")
     _say(f"  {out / 'night.png'}  night mode")
     return 0
@@ -416,6 +420,19 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:
+        # `sentinelle-display config | head` closes the pipe while we are still
+        # writing. Every Unix tool has to handle this; Python's default is to
+        # raise, print a traceback, and then raise AGAIN from the interpreter's
+        # final flush of stdout — three screens of noise for a command that
+        # actually worked.
+        #
+        # Pointing stdout at /dev/null is the documented fix: it gives that
+        # final flush somewhere harmless to go. 141 is the conventional status
+        # for death by SIGPIPE (128 + 13), which is what a C program would
+        # exit with here.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 141
 
 
 if __name__ == "__main__":
