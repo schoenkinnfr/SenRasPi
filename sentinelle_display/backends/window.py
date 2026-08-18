@@ -95,9 +95,21 @@ class WindowBackend:
         self._label = tk.Label(self._root, bd=0, highlightthickness=0, bg="black")
         self._label.pack(fill="both", expand=True)
         self._photo = None            # a live reference; Tk will not keep one
+        self._last_click = 0.0
 
-        for widget in (self._root, self._label):
-            widget.bind("<Button-1>", self._clicked)
+        # Bound on the TOPLEVEL ONLY, and this is load bearing.
+        #
+        # Binding both the root and the label looks harmless and is not: a real
+        # click on the label fires the label's binding AND then propagates to
+        # the toplevel's, so every press is delivered twice. Each button here
+        # toggles, so a double delivery cancels itself out -- UNITS went
+        # mg/dL -> mmol/L -> mg/dL and appeared completely dead, while NIGHT
+        # silently skipped a step.
+        #
+        # Synthetic `event_generate` on the root does NOT reproduce this: it
+        # delivers straight to the root and fires once. It only shows up under
+        # a real pointer, which is why this shipped.
+        self._root.bind("<Button-1>", self._clicked)
         # Escape and q are an escape hatch for when the window manager has no
         # decorations and a fullscreen app would otherwise be inescapable
         # without SSH.
@@ -126,6 +138,14 @@ class WindowBackend:
         return w, h
 
     def _clicked(self, event) -> None:
+        # Belt and braces against a window manager or toolkit delivering the
+        # same press twice. 120ms is far below a deliberate double-press on a
+        # touchscreen and far above any duplicate-delivery interval.
+        import time as _time
+        now = _time.monotonic()
+        if now - self._last_click < 0.12:
+            return
+        self._last_click = now
         if self.on_click:
             try:
                 self.on_click(event.x, event.y)

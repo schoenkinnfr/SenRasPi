@@ -170,6 +170,7 @@ def render(
     bar: bool = False,
     hint: bool = False,
     force_day: bool = False,
+    pollen=None,
 ) -> Image.Image:
     """The whole screen. Never raises — a renderer that throws leaves a Pi
     showing a frozen frame with no clue why, so failures are drawn instead.
@@ -225,7 +226,14 @@ def render(
     else:
         _draw_hero(draw, content, pal, cfg, d, stale)
         _draw_rail(draw, content, pal, cfg, d)
-        _draw_trend(draw, content, pal, cfg, d, now)
+        if pollen is not None:
+            # Trend gets 75% of the row, the allergen panel the rest.
+            _draw_trend(draw, content, pal, cfg, d, now, width_frac=0.75)
+            _draw_pollen(draw, content, pal, pollen,
+                         x0=content.px(16) + int((content.w - content.px(24)) * 0.75)
+                            + content.px(6))
+        else:
+            _draw_trend(draw, content, pal, cfg, d, now)
         _draw_footer(draw, content, pal, cfg, d, snap, now)
 
     # Drawn LAST so nothing covers the controls.
@@ -554,6 +562,75 @@ def _draw_rail(draw, lay: Layout, pal: Palette, cfg, d: dict) -> None:
         ry += lay.px(19)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Allergen panel.
+#
+# Colour here is a SEQUENTIAL ramp in one hue, not the glucose status palette.
+# Red/green/amber are reserved: a red pollen row next to a red glucose number
+# would read as the same kind of alarm, and it is not. Magnitude is carried by
+# a bar whose length encodes the band, and the band is ALWAYS written in words,
+# so the hue is support rather than the message.
+
+POLLEN_HUE = {
+    "Low":       (0x4c, 0x46, 0x6b),
+    "Moderate":  (0x6f, 0x63, 0xa2),
+    "High":      (0x93, 0x80, 0xd2),
+    "Very high": (0xb8, 0xa2, 0xff),
+}
+
+
+def _draw_pollen(draw, lay: Layout, pal: Palette, reading, x0: int) -> None:
+    """The right-hand column. `reading` is a pollen.PollenReading."""
+    x1 = lay.w - lay.px(8)
+    y0, y1 = lay.px(180), lay.px(268)
+    draw.rectangle([x0, y0, x1, y1], fill=pal.panel)
+
+    pad = lay.px(7)
+    tx = x0 + pad
+    f_cap = font("regular", lay.pt(9))
+    f_band = font("bold", lay.pt(15))
+    f_row = font("regular", lay.pt(11))
+
+    # The location rides in the header rather than on its own line at the
+    # bottom: at 120px wide the panel has room for a header, a band, a bar and
+    # THREE species rows, and a separate footer line pushed the third row off
+    # the bottom edge.
+    label = (reading.label if reading else "") or ""
+    age = reading.age_minutes if reading else None
+    header = f"POLLEN · {label.upper()}" if label else "POLLEN"
+    if age is not None and age > 90:
+        header = f"{header} · {int(age // 60)}H"
+    _text(draw, (tx, y0 + lay.px(5)), header[:20], f_cap, pal.ink_3)
+
+    if reading is None or not reading.species:
+        why = "out of season" if (reading and reading.ok) else "no data"
+        _text(draw, ((x0 + x1) // 2, (y0 + y1) // 2), why,
+              f_row, pal.ink_3, anchor="mm")
+        return
+
+    worst_name, worst_value, worst_band = reading.species[0]
+    _text(draw, (tx, y0 + lay.px(16)), worst_band, f_band, pal.ink)
+
+    # The magnitude bar. Four steps, so it reads at a glance from the length
+    # even before the word resolves.
+    steps = ["Low", "Moderate", "High", "Very high"].index(worst_band) + 1
+    bw = (x1 - pad - tx)
+    bh = lay.px(4)
+    by = y0 + lay.px(36)
+    draw.rectangle([tx, by, tx + bw, by + bh], fill=pal.rule)
+    draw.rectangle([tx, by, tx + int(bw * steps / 4), by + bh],
+                   fill=POLLEN_HUE.get(worst_band, pal.ink_3))
+
+    # Up to three species, worst first, each with its raw grains/m3 so the
+    # number behind our banding is never hidden.
+    ry = y0 + lay.px(46)
+    for name, value, _band in reading.species[:3]:
+        _text(draw, (tx, ry), name.capitalize()[:8], f_row, pal.ink_2)
+        _text(draw, (x1 - pad, ry), f"{value:.0f}", f_row, pal.ink_2, anchor="ra")
+        ry += lay.px(13)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Trend. Two pure functions first, because they carry the decisions worth
 # testing and testing them through rendered pixels is both brittle and a poor
@@ -616,8 +693,14 @@ def split_on_gaps(points: list[Point], gap_minutes: float = GAP_MINUTES) -> list
 # Trend. Target band first, then the line on top of it.
 
 
-def _draw_trend(draw, lay: Layout, pal: Palette, cfg, d: dict, now: float) -> None:
+def _draw_trend(draw, lay: Layout, pal: Palette, cfg, d: dict, now: float,
+                width_frac: float = 1.0) -> None:
     x0, x1 = lay.px(16), lay.w - lay.px(8)
+    if width_frac < 1.0:
+        # Shrink from the RIGHT so the left edge (oldest reading) stays put.
+        # Moving both edges would make the curve appear to slide sideways the
+        # moment the pollen panel appeared or vanished.
+        x1 = x0 + int((x1 - x0) * width_frac)
     y0, y1 = lay.px(180), lay.px(268)
     draw.rectangle([x0, y0, x1, y1], fill=pal.panel)
 

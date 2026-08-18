@@ -276,7 +276,71 @@ logging in.
 
 ---
 
-## 7. Settings
+## 7. The allergen panel
+
+Off by default. Turn it on and the trend graph gives up its right-hand quarter
+to a pollen column:
+
+```bash
+sentinelle-display config --set pollen=on
+sudo reboot            # or just restart the app
+```
+
+Defaults to **Edgware** (51.6136, -0.2750). Change it:
+
+```bash
+sentinelle-display config --set pollen_lat=51.5072 --set pollen_lon=-0.1276 \
+                          --set pollen_label="London"
+```
+
+**Source: Open-Meteo's Air Quality API** — the Copernicus CAMS European model
+at ~11 km resolution, six species (alder, birch, grass, mugwort, olive,
+ragweed) in grains/m³, no API key. Two properties matter:
+
+- **Europe only.** CAMS has no pollen over North America. This is also why the
+  panel does *not* reuse the OpenClaw morning briefing's pollen: that pipeline
+  reads pollen.com by US ZIP code and has no London coverage at all.
+- **Seasonal.** Out of season the API returns `null`, not `0`. Those are
+  different facts, so nulls are dropped and an empty response reads **"out of
+  season"** rather than showing a reassuring zero for a measurement nobody
+  took.
+
+### Reading it
+
+The panel leads with the worst species, its band in words, and a four-step bar.
+Beneath it, up to three species with their **raw grains/m³**, so the number
+behind the banding is never hidden.
+
+Grass uses the **UK Met Office bands** (`<30` low, `30–49` moderate, `50–149`
+high, `150+` very high) — the scale behind the headline number in a UK
+forecast. Tree and weed species are banded on their own scales, because
+absolute counts differ by an order of magnitude between them: 30 grains of
+ragweed is High while 30 of birch is only Moderate. Those per-species
+thresholds are less standardised than the grass ones; treat them as
+indicative, which is why the raw figure is always shown.
+
+Colour is a single violet ramp, deliberately **not** the glucose red/green/
+amber. Those are reserved — a red pollen row beside a red glucose number would
+read as the same kind of alarm, and it isn't. The band is always written out,
+so hue is never carrying the message alone.
+
+### Pointing it at OpenClaw instead
+
+```bash
+sentinelle-display config --set allergy_url=https://your-host/pollen.json
+```
+
+Serve the same JSON shape (`{"current": {"grass_pollen": 62.4, ...}}`) and
+nothing else changes. Pollen is fetched on its own thread every 30 minutes —
+CAMS publishes hourly at best — and a pollen outage can never disturb the
+glucose reading beside it.
+
+`sentinelle-display probe` prints the current counts, which is the quickest way
+to tell "out of season" from "not reachable".
+
+---
+
+## 8. Settings
 
 ```bash
 sentinelle-display config                       # show everything
@@ -297,6 +361,11 @@ sudo systemctl restart sentinelle-display       # settings apply on restart
 | `rotate` | `0` | `0`/`90`/`180`/`270`. See the note below. |
 | `backend` | `auto` | `auto`, `window`, `fb`, `spi`, `png` |
 | `night_mode` | `auto` | `auto` follows the schedule; `on`/`off` force the wash |
+| `pollen` | `off` | `on` shows the allergen panel and narrows the graph to 75% |
+| `pollen_lat` / `pollen_lon` | Edgware | Where to read pollen for |
+| `pollen_label` | `Edgware` | Shown in the panel header |
+| `pollen_minutes` | `30` | How often to refresh pollen |
+| `allergy_url` | — | Override the endpoint entirely (e.g. an OpenClaw one) |
 | `touch` | `auto` | `auto`, `off`, or a literal `/dev/input/eventN` |
 | `view` | `full` | Which view to start in: `full` or `minimal` |
 | `night_wake_seconds` | `30` | How long a night-time tap shows the real screen. `0` disables |
@@ -321,7 +390,7 @@ red/blue/amber set that separates under all three common types.
 
 ---
 
-## 8. When it does not work
+## 9. When it does not work
 
 Run `sentinelle-display probe` first. It answers most of these.
 
@@ -341,6 +410,8 @@ Run `sentinelle-display probe` first. It answers most of these.
 | The dashboard gets eaten away when you touch it | You are on the `fb` backend with a desktop running; both write to `/dev/fb0`. Use `--set backend=window`, or boot to console. |
 | Nothing starts after login | `cat ~/.local/state/sentinelle-display.log`. If the file does not exist, the autostart entry is missing — re-run `./install.sh`. |
 | `cannot open a window` | No `DISPLAY`/`WAYLAND_DISPLAY`. On a desktop it is started from the session's autostart, not systemd, precisely because units have neither. |
+| Panel says "out of season" | Correct, not broken — that species reports null this time of year. `probe` shows the raw counts. |
+| Panel says "no data" | The fetch failed. Check the Pi has internet, and remember CAMS has no pollen coverage outside Europe. |
 | Tapping does nothing | `probe` says whether a touchscreen was found. If it was, you are probably not in the `input` group yet — that needs a **reboot**, not a new shell. |
 | No **more**/**less** chip | No touchscreen detected, so the button is deliberately not drawn. Advertising a control that does not exist is worse than omitting it. |
 | A plain colour wash with one small number | That is night mode, working. Check `timedatectl` — a Pi still on UTC thinks it is 4-5 hours later than you do. `config --set night=off` disables it. |
@@ -361,7 +432,7 @@ That split saves an evening.
 
 ---
 
-## 9. What this can and cannot see
+## 10. What this can and cannot see
 
 Pairing produces a **kiosk token**, stored in `~/.config/sentinelle/display.json`
 mode 600. It:
@@ -383,7 +454,7 @@ enumerate valid codes.
 
 ---
 
-## 10. Development
+## 11. Development
 
 The renderer touches no hardware and no network, so you can work on it from a
 laptop:

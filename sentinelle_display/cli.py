@@ -147,7 +147,8 @@ def cmd_run(args) -> int:
         "night_mode": cfg.night_mode,
         "units": cfg.units,
     }
-    ui = {"bar_until": 0.0, "wake_until": 0.0, "quit": False, "backend": None}
+    ui = {"bar_until": 0.0, "wake_until": 0.0, "quit": False,
+          "hidden": False, "backend": None}
     BAR_SECONDS = 8.0
 
     def on_click(x: float, y: float) -> None:
@@ -179,10 +180,17 @@ def cmd_run(args) -> int:
             cfg.units = state["units"]
         elif key == "minimize":
             if hasattr(backend, "minimize"):
-                backend.minimize()
+                backend.minimize()          # a real window: to the taskbar
                 ui["bar_until"] = 0.0
             else:
-                ui["quit"] = True           # no window manager: exit instead
+                # No window manager (fb/spi on a headless panel), so the only
+                # way to hand the screen back is to exit. It must exit with
+                # EXIT_HIDDEN: the unit lists that under
+                # RestartPreventExitStatus, and any other code would have
+                # systemd restart it five seconds later, making Minimize look
+                # like a flicker.
+                ui["hidden"] = True
+                ui["quit"] = True
             _persist()
             return
         else:
@@ -215,6 +223,7 @@ def cmd_run(args) -> int:
                 bar=now < ui["bar_until"],
                 hint=clickable and now >= ui["bar_until"],
                 force_day=now < ui["wake_until"],
+                pollen=pollen_poller.get() if pollen_poller else None,
             ))
         except Exception as e:
             _err(f"render/display error: {e}")
@@ -238,6 +247,18 @@ def cmd_run(args) -> int:
     poller = Poller(cfg)
     watcher = None
     last_error: str | None = None
+
+    # Pollen is optional and entirely separate from glucose: it has its own
+    # thread, its own much slower interval, and its own failure mode. A pollen
+    # outage must never affect the glucose reading, so nothing here is allowed
+    # to raise into the render loop.
+    pollen_poller = None
+    if cfg.pollen == "on":
+        from .pollen import PollenPoller                        # noqa: PLC0415
+        pollen_poller = PollenPoller(cfg)
+        pollen_poller.start()
+        _say(f"pollen={cfg.pollen_label} ({cfg.pollen_lat}, {cfg.pollen_lon})"
+             f"{' via ' + cfg.allergy_url if cfg.allergy_url else ''}")
 
     # A touchscreen read from /dev/input is only needed when there is no
     # display server to deliver clicks. Under `window` the toolkit already
@@ -295,12 +316,17 @@ def cmd_run(args) -> int:
                 wake.clear()
     finally:
         poller.stop()
+        if pollen_poller:
+            pollen_poller.stop()
         if watcher:
             watcher.stop()
         try:
             backend.close()
         except Exception:
             pass
+    if ui["hidden"]:
+        _say("hidden — bring it back with: sentinelle-display show")
+        return EXIT_HIDDEN
     return 0
 
 
@@ -420,6 +446,27 @@ def cmd_probe(_args) -> int:
     _say(f"  touch        {cfg.touch}")
     _say(f"  view         {cfg.view}")
     _say(f"  night        {cfg.night} (mode: {cfg.night_mode})")
+
+    if cfg.pollen == "on":
+        _say()
+        _say("Pollen")
+        _say(f"  location     {cfg.pollen_label} ({cfg.pollen_lat}, {cfg.pollen_lon})")
+        _say(f"  source       {cfg.allergy_url or 'open-meteo air quality (CAMS)'}")
+        try:
+            from .pollen import PollenPoller
+            pp = PollenPoller(cfg)
+            pp._fetch_once()
+            r = pp.get()
+            if r.species:
+                for name, value, band in r.species[:3]:
+                    _say(f"  {name:<12} {value:>7.1f} grains/m3   {band}")
+            elif r.last_error:
+                _say(f"  {r.last_error}")
+            else:
+                _say("  nothing reported — out of season, or outside Europe "
+                     "(CAMS has no pollen over North America)")
+        except Exception as e:
+            _say(f"  could not fetch: {e}")
 
     if cfg.token:
         _say()
@@ -741,7 +788,7 @@ def _add_display_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--high", type=int, help="high threshold, mg/dL")
     sp.add_argument("--hours", type=int, help="hours of trend to draw (1-12)")
     sp.add_argument("--rotate", type=int, choices=[0, 90, 180, 270])
-    sp.add_argument("--backend", choices=["auto", "fb", "spi", "png"])
+    sp.add_argument("--backend", choices=["auto", "window", "fb", "spi", "png"])
     sp.add_argument("--width", type=int)
     sp.add_argument("--height", type=int)
     sp.add_argument("--panel", help="ili9486 | ili9488 | st7796 | st7789 | st7735")

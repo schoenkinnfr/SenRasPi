@@ -81,6 +81,19 @@ class Config:
     # fading back to the ambient wash. 0 disables the wake.
     night_wake_seconds: int = 30
 
+    # --- allergen panel --------------------------------------------------
+    # Pollen from Open-Meteo's Air Quality API (Copernicus CAMS, ~11km,
+    # grains/m3, no key). EUROPE ONLY -- CAMS has no pollen over North
+    # America, so this panel is off unless you turn it on.
+    pollen: str = "off"                  # "on" | "off"
+    pollen_lat: float = 51.6136          # Edgware, Greater London
+    pollen_lon: float = -0.2750
+    pollen_label: str = "Edgware"
+    pollen_minutes: int = 30             # CAMS publishes hourly at best
+    # Override the endpoint entirely -- point this at an OpenClaw endpoint
+    # serving the same JSON shape and nothing else has to change.
+    allergy_url: str = ""
+
     # --- runtime-only, never persisted ---------------------------------------
     _transient: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -113,6 +126,11 @@ class Config:
             problems.append(f"units must be mgdl or mmol (got {self.units!r})")
         if not 1 <= self.hours <= 12:
             problems.append(f"hours must be between 1 and 12 (got {self.hours})")
+        if self.pollen not in ("on", "off"):
+            problems.append(f"pollen must be on or off (got {self.pollen!r})")
+        if not -90 <= self.pollen_lat <= 90 or not -180 <= self.pollen_lon <= 180:
+            problems.append(f"pollen_lat/pollen_lon out of range "
+                            f"({self.pollen_lat}, {self.pollen_lon})")
         if self.night_mode not in ("auto", "on", "off"):
             problems.append(f"night_mode must be auto, on or off (got {self.night_mode!r})")
         if self.view not in ("full", "minimal"):
