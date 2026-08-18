@@ -68,8 +68,15 @@ class Config:
     pin_dc: int = 24             # BCM numbering
     pin_reset: int = 25
     pin_backlight: int = 18      # -1 if the panel has no controllable backlight
-    touch: str = "off"           # "off" | "xpt2046"
-    touch_device: int = 1        # SPI CE for the XPT2046
+    # "auto" finds the touchscreen in /proc/bus/input/devices; "off" disables
+    # input entirely; anything else is treated as a literal /dev/input/eventN.
+    # A tap ANYWHERE toggles the view -- see touch.py for why there is no
+    # hit-region.
+    touch: str = "auto"
+    view: str = "full"           # "full" dashboard | "minimal" big number
+    # A tap during the night window shows the real screen for this long before
+    # fading back to the ambient wash. 0 disables the wake.
+    night_wake_seconds: int = 30
 
     # --- runtime-only, never persisted ---------------------------------------
     _transient: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -103,6 +110,8 @@ class Config:
             problems.append(f"units must be mgdl or mmol (got {self.units!r})")
         if not 1 <= self.hours <= 12:
             problems.append(f"hours must be between 1 and 12 (got {self.hours})")
+        if self.view not in ("full", "minimal"):
+            problems.append(f"view must be full or minimal (got {self.view!r})")
         if self.rotate not in (0, 90, 180, 270):
             problems.append(f"rotate must be 0, 90, 180 or 270 (got {self.rotate})")
         if self.low >= self.high:

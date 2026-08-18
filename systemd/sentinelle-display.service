@@ -9,10 +9,14 @@ After=network-online.target
 [Service]
 Type=simple
 User=pi
-SupplementaryGroups=spi gpio video
+SupplementaryGroups=spi gpio video input
 ExecStart=/opt/sentinelle-display/bin/sentinelle-display run
 Restart=always
 RestartSec=5
+# Exit code 64 is "the user held a finger on the screen to hide me".
+# Without this, Restart=always brings it back after five seconds and the
+# gesture looks broken.
+RestartPreventExitStatus=64
 # A crash loop must not fill the SD card with journal. Cards are the usual
 # cause of a Pi that dies after three months; writes are the usual cause of a
 # dead card.
@@ -32,6 +36,7 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
 # /dev/fb*, /dev/spidev* and /dev/gpiochip* are the only devices it touches.
+DeviceAllow=char-input r
 DeviceAllow=char-spi rw
 DeviceAllow=char-gpiochip rw
 DeviceAllow=/dev/fb0 rw

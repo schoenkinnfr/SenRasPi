@@ -157,9 +157,32 @@ def _width(draw: ImageDraw.ImageDraw, s: str, f) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def render(cfg, snap: Snapshot, now: float | None = None) -> Image.Image:
+VIEWS = ("full", "minimal")
+
+
+def render(
+    cfg,
+    snap: Snapshot,
+    now: float | None = None,
+    view: str = "full",
+    show_button: bool = False,
+    force_day: bool = False,
+    can_hide: bool = True,
+) -> Image.Image:
     """The whole screen. Never raises — a renderer that throws leaves a Pi
-    showing a frozen frame with no clue why, so failures are drawn instead."""
+    showing a frozen frame with no clue why, so failures are drawn instead.
+
+    `view` selects between the full dashboard and the across-the-room one.
+    Night mode overrides both: a bright dashboard in a bedroom at 3am is not
+    what anyone wants, and that stays true whichever view is selected --
+    unless `force_day`, which is what a tap during the night window sets, so
+    walking past at 3am and touching the glass shows you the real screen for
+    a few seconds before it fades back.
+
+    `show_button` is passed by the caller rather than read from cfg because
+    only the caller knows whether a touchscreen was actually FOUND. Drawing a
+    button on a panel that cannot be tapped is worse than drawing nothing.
+    """
     now = now or time.time()
     lay = Layout(*_logical_size(cfg))
 
@@ -175,21 +198,60 @@ def render(cfg, snap: Snapshot, now: float | None = None) -> Image.Image:
 
     pal = STALE if stale else palette(getattr(cfg, "palette", "clinical"))
 
-    if _is_night(cfg, now):
+    if is_night(cfg, now) and not force_day:
         return _render_night(cfg, lay, pal, d, stale)
 
     img = Image.new("RGB", (lay.w, lay.h), pal.bg)
     draw = ImageDraw.Draw(img)
 
-    _draw_hero(draw, lay, pal, cfg, d, stale)
-    _draw_rail(draw, lay, pal, cfg, d)
-    _draw_trend(draw, lay, pal, cfg, d, now)
-    _draw_footer(draw, lay, pal, cfg, d, snap, now)
+    if view == "minimal":
+        _draw_minimal(draw, lay, pal, cfg, d, stale, now)
+    else:
+        _draw_hero(draw, lay, pal, cfg, d, stale)
+        _draw_rail(draw, lay, pal, cfg, d)
+        _draw_trend(draw, lay, pal, cfg, d, now)
+        _draw_footer(draw, lay, pal, cfg, d, snap, now)
+
+    # The button is drawn LAST so it is never covered. It is an affordance,
+    # not the hit target — a tap anywhere on the glass toggles the view (see
+    # touch.py for why). Without something visible, a screen showing one big
+    # number gives no hint that a dashboard exists behind it.
+    if show_button:
+        _draw_view_button(draw, lay, pal, view, can_hide=can_hide)
 
     if snap.offline:
         _draw_offline_banner(draw, lay, pal, snap)
 
     return _orient(img, cfg)
+
+
+def _draw_view_button(draw, lay: Layout, pal: Palette, view: str,
+                      can_hide: bool = True) -> None:
+    """Two chips in the bottom-right corner naming both gestures.
+
+    Deliberately understated: this is an ambient display, and a bright button
+    competing with the glucose number would be the wrong thing to notice from
+    across a room. But a control nobody can discover is not a control, and
+    "hold to hide" is not a gesture anyone guesses.
+
+    The chips are labels, not hit targets -- a tap or hold ANYWHERE on the
+    glass works. See touch.py for why there is no hit-region.
+    """
+    f = font("regular", lay.pt(11))
+    chips = [f"tap · {'more' if view == 'minimal' else 'less'}"]
+    if can_hide:
+        chips.append("hold · hide")
+
+    x1 = lay.w - lay.px(6)
+    y1, h = lay.h - lay.px(5), lay.px(20)
+    y0 = y1 - h
+    for label in reversed(chips):
+        w = int(draw.textlength(label, font=f)) + lay.px(14)
+        x0 = x1 - w
+        draw.rounded_rectangle([x0, y0, x1, y1], radius=lay.px(5),
+                               fill=pal.panel, outline=pal.rule, width=lay.px(1))
+        _text(draw, ((x0 + x1) // 2, (y0 + y1) // 2), label, f, pal.ink_3, anchor="mm")
+        x1 = x0 - lay.px(5)
 
 
 def _logical_size(cfg) -> tuple[int, int]:
@@ -260,6 +322,67 @@ def _draw_hero(draw, lay: Layout, pal: Palette, cfg, d: dict, stale: bool) -> No
     f_unit = font("regular", lay.pt(15))
     _text(draw, (x + lay.px(3), row_y + lay.px(25)),
           "mmol/L" if cfg.units == "mmol" else "mg/dL", f_unit, pal.ink_3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal view: the number, as large as the panel allows.
+
+
+def _draw_minimal(draw, lay: Layout, pal: Palette, cfg, d: dict, stale: bool,
+                  now: float) -> None:
+    """Glucose, trend, and how old it is. Nothing else.
+
+    The full dashboard is for standing in front of the screen. This is for
+    glancing at it from the other side of the room, where a 40px IOB figure
+    is unreadable anyway and the only question is "what is it doing".
+    """
+    mgdl = d.get("mgdl")
+    state = _state(mgdl, cfg.low, cfg.high) if mgdl is not None else "in_range"
+    colour = pal.for_state(state)
+    value = _fmt_value(mgdl, cfg.units)
+    trend = TRENDS.get(str(d.get("trend") or "").upper())
+
+    # Fit to the panel rather than trusting a point size: "24.4" in mmol/L is
+    # four glyphs, a triple arrow is three arrows wide, and the condensed face
+    # may not be installed.
+    arrow_budget = lay.px(30 + 22 * (trend[1] - 1) + 70) if trend else 0
+    available = lay.w - lay.px(36) - arrow_budget
+    for size in (210, 190, 170, 150, 130, 110):
+        f_hero = font("condensed", lay.pt(size))
+        if _width(draw, value, f_hero) <= available:
+            break
+
+    vw = _width(draw, value, f_hero)
+    total = vw + arrow_budget
+    x = (lay.w - total) // 2
+    y = lay.px(18)
+    _text(draw, (x, y), value, f_hero, colour)
+    bbox = draw.textbbox((x, y), value, font=f_hero)
+
+    if trend:
+        angle, count = trend
+        _draw_arrows_scaled(draw, lay, x + vw + arrow_budget // 2,
+                            (bbox[1] + bbox[3]) // 2, angle, count, colour, scale=1.6)
+
+    # One line underneath carrying the two facts a glance needs: what state
+    # this is (in words, never colour alone) and whether the number is current.
+    minutes = d.get("minutes_ago")
+    parts = ["STALE" if stale else STATE_WORD[state], _fmt_age(minutes)]
+    delta = _fmt_delta(d.get("delta"), cfg.units)
+    if delta:
+        parts.insert(1, delta)
+    line = "   ·   ".join(parts)
+    f_sub = font("bold", lay.pt(20))
+    _text(draw, (lay.w // 2, lay.h - lay.px(38)), line, f_sub,
+          pal.high if stale else pal.ink_2, anchor="mm")
+
+    _text(draw, (lay.px(10), lay.h - lay.px(8)),
+          "mmol/L" if cfg.units == "mmol" else "mg/dL",
+          font("regular", lay.pt(11)), pal.ink_3, anchor="ls")
+
+    _text(draw, (lay.w // 2, lay.h - lay.px(8)),
+          datetime.fromtimestamp(now).strftime("%H:%M"),
+          font("regular", lay.pt(11)), pal.ink_3, anchor="ms")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,7 +629,7 @@ def _draw_offline_banner(draw, lay: Layout, pal: Palette, snap: Snapshot) -> Non
 # Night mode and the empty state.
 
 
-def _is_night(cfg, now: float) -> bool:
+def is_night(cfg, now: float) -> bool:
     win = cfg.night_window
     if not win:
         return False
@@ -556,14 +679,19 @@ def _render_empty(cfg, lay: Layout, snap: Snapshot) -> Image.Image:
 def _draw_arrows(draw, lay: Layout, cx: int, cy: int, angle: int, count: int, colour) -> None:
     """One to three arrows at `angle` degrees, stacked across the direction of
     travel so a double arrow reads as 'fast', not as two separate readings."""
-    length = lay.px(42)
-    head = lay.px(13)
-    shaft = lay.px(7)
+    _draw_arrows_scaled(draw, lay, cx, cy, angle, count, colour, scale=1.0)
+
+
+def _draw_arrows_scaled(draw, lay: Layout, cx: int, cy: int, angle: int, count: int,
+                        colour, scale: float = 1.0) -> None:
+    length = lay.px(42 * scale)
+    head = lay.px(13 * scale)
+    shaft = lay.px(7 * scale)
     rad = math.radians(angle)
     dx, dy = math.cos(rad), -math.sin(rad)
     # Perpendicular offset, so stacked arrows sit side by side.
     px_, py = -dy, dx
-    spacing = lay.px(15)
+    spacing = lay.px(15 * scale)
     start = -(count - 1) / 2
 
     for i in range(count):

@@ -19,6 +19,7 @@ import argparse
 import os
 import signal
 import sys
+import threading
 import time
 from typing import Any
 
@@ -27,6 +28,11 @@ from .client import PairError, Poller, format_code, normalise_code, redeem_code
 
 EXIT_CONFIG = 2
 EXIT_HARDWARE = 3
+# Long-press-to-hide exits with this. The systemd unit lists it under
+# RestartPreventExitStatus, so it is the one exit code that does NOT get
+# restarted five seconds later -- which is what makes "hide" mean hidden
+# rather than "flicker and come back".
+EXIT_HIDDEN = 64
 
 
 def _say(msg: str = "") -> None:
@@ -149,13 +155,64 @@ def cmd_run(args) -> int:
     poller = Poller(cfg)
     stopping = False
 
+    # `wake` doubles as the frame clock and the "something happened, redraw
+    # now" signal. Without it a tap would wait out the sleep below before
+    # anything changed on screen, which reads as an unresponsive screen.
+    wake = threading.Event()
+    view = cfg.view if cfg.view in renderer.VIEWS else "full"
+    wake_until = 0.0
+    hidden = False
+
     def handle(signum, _frame):
         nonlocal stopping
         stopping = True
         poller.stop()
+        wake.set()
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
+
+    # ---- touchscreen -------------------------------------------------------
+    watcher = None
+    if cfg.touch != "off":
+        from .touch import TouchWatcher                       # noqa: PLC0415
+
+        def on_long_press() -> None:
+            nonlocal stopping, hidden
+            hidden = True
+            stopping = True
+            poller.stop()
+            wake.set()
+
+        def on_tap() -> None:
+            nonlocal view, wake_until
+            # During the night window a tap does NOT toggle the view -- it
+            # wakes the screen. Someone walking past at 3am wants to see the
+            # number, not to discover they have silently changed a setting
+            # they will not notice until morning.
+            if renderer.is_night(cfg, time.time()) and cfg.night_wake_seconds > 0:
+                wake_until = time.time() + cfg.night_wake_seconds
+            else:
+                view = "minimal" if view == "full" else "full"
+            wake.set()
+
+        watcher = TouchWatcher(None if cfg.touch == "auto" else cfg.touch,
+                               on_tap, on_long_press)
+        watcher.start()
+        # Give the thread a moment to open the device so the first frame
+        # already knows whether to draw the button.
+        time.sleep(0.2)
+        if watcher.error:
+            _err(f"touch: {watcher.error}")
+        else:
+            _say(f"touch={watcher.path} — tap to switch view, hold to hide")
+
+    show_button = bool(watcher and watcher.path and not watcher.error)
+    # Only advertise "hold to hide" when hiding actually works. Under systemd
+    # the unit's RestartPreventExitStatus honours EXIT_HIDDEN; run by hand from
+    # a shell there is no supervisor, so the process simply exits -- still
+    # correct, so the chip is shown either way.
+    can_hide = show_button
 
     poller.start()
     last_error: str | None = None
@@ -168,28 +225,49 @@ def cmd_run(args) -> int:
             elif snap.ok and last_error:
                 _say("recovered")
                 last_error = None
+
+            awake = time.time() < wake_until
             try:
-                backend.show(renderer.render(cfg, snap))
+                backend.show(renderer.render(
+                    cfg, snap, view=view, show_button=show_button,
+                    force_day=awake, can_hide=can_hide,
+                ))
             except Exception as e:  # a bad frame must not end the process
                 _err(f"render/display error: {e}")
+
             # Redraw on a 10s cadence even though data arrives every 60s: the
-            # clock and the "N min ago" counter both need to stay honest.
-            for _ in range(10):
-                if stopping:
-                    break
-                time.sleep(1)
+            # clock and the "N min ago" counter both have to stay honest. Cut
+            # that short while a night wake is counting down so the screen
+            # fades back promptly rather than up to 10s late.
+            wake.wait(1 if awake else 10)
+            wake.clear()
     finally:
         poller.stop()
+        if watcher:
+            watcher.stop()
+        if hidden:
+            # Blank the panel on the way out. Leaving the last dashboard frame
+            # sitting there would show a number that is no longer being
+            # refreshed -- the exact thing this program refuses to do
+            # everywhere else.
+            try:
+                from PIL import Image as _Image
+                backend.show(_Image.new("RGB", (backend.width, backend.height), (0, 0, 0)))
+            except Exception:
+                pass
         try:
             backend.close()
         except Exception:
             pass
+    if hidden:
+        _say("hidden — bring it back with: sentinelle-display show")
+        return EXIT_HIDDEN
     return 0
 
 
 def _apply_overrides(cfg, args) -> None:
     for name in ("units", "low", "high", "hours", "rotate", "backend",
-                 "width", "height", "panel", "night", "palette"):
+                 "width", "height", "panel", "night", "palette", "view", "touch"):
         v = getattr(args, name, None)
         if v is not None:
             setattr(cfg, name, v)
@@ -242,6 +320,23 @@ def cmd_probe(_args) -> int:
         _say(f"  could not enumerate: {e}")
 
     _say()
+    _say("Touchscreen")
+    try:
+        from .touch import find_touch_device, list_input_devices
+        devs = list_input_devices()
+        if devs:
+            chosen = find_touch_device()
+            for d in devs:
+                mark = "  <- would use" if d["device"] == chosen else ""
+                _say(f"  {d['device']:<18} {d['name']}{mark}")
+            if not chosen:
+                _say("  no device looks like a touchscreen; set touch=/dev/input/eventN")
+        else:
+            _say("  no input devices at all")
+    except Exception as e:
+        _say(f"  could not enumerate: {e}")
+
+    _say()
     _say("Backlight")
     bls = sorted(Path("/sys/class/backlight").glob("*"))
     _say("  " + (", ".join(p.name for p in bls) if bls else
@@ -265,6 +360,8 @@ def cmd_probe(_args) -> int:
     _say(f"  token        {'set' if cfg.token else 'MISSING — run pair'}")
     _say(f"  backend      {cfg.backend}")
     _say(f"  geometry     {cfg.width}x{cfg.height} rotate {cfg.rotate}")
+    _say(f"  touch        {cfg.touch}")
+    _say(f"  view         {cfg.view}")
 
     if cfg.token:
         _say()
@@ -366,6 +463,68 @@ def cmd_config(args) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Service control. Thin wrappers so neither you nor a desktop launcher has to
+# remember systemctl syntax, and so the .desktop entry has one stable command
+# to call.
+
+
+SERVICE = "sentinelle-display"
+
+
+def _systemctl(action: str) -> int:
+    import shutil
+    import subprocess
+
+    if not shutil.which("systemctl"):
+        _err("systemctl not found — this machine does not use systemd.")
+        _err("Start the display directly instead:  sentinelle-display run")
+        return EXIT_CONFIG
+
+    cmd = ["systemctl", action, SERVICE]
+    if os.geteuid() != 0:
+        # install.sh drops a sudoers rule permitting exactly start/stop/restart
+        # of this one unit without a password, so the desktop launcher works
+        # with a single click. If that rule is absent sudo prompts, which on a
+        # launcher click means nothing visibly happens -- hence the hint.
+        cmd = ["sudo", "-n", *cmd]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        _err(f"could not {action} {SERVICE}: {detail or 'unknown error'}")
+        if "password" in detail.lower() or "sudo" in detail.lower():
+            _err("Re-run ./install.sh to install the sudoers rule, or use:")
+            _err(f"  sudo systemctl {action} {SERVICE}")
+        return 1
+    return 0
+
+
+def cmd_show(_args) -> int:
+    """Bring the display back after a long-press hide."""
+    rc = _systemctl("start")
+    if rc == 0:
+        _say("display started")
+    return rc
+
+
+def cmd_hide(_args) -> int:
+    """Same as holding a finger on the screen."""
+    rc = _systemctl("stop")
+    if rc == 0:
+        _say("display hidden — bring it back with: sentinelle-display show")
+    return rc
+
+
+def cmd_status(_args) -> int:
+    import subprocess
+    proc = subprocess.run(["systemctl", "is-active", SERVICE],
+                          capture_output=True, text=True)
+    state = proc.stdout.strip() or "unknown"
+    _say(f"{SERVICE}: {state}")
+    return 0 if state == "active" else 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -394,6 +553,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_display_args(prev)
     prev.set_defaults(func=cmd_preview)
 
+    sub.add_parser("show", help="start the display (undo a long-press hide)"
+                   ).set_defaults(func=cmd_show)
+    sub.add_parser("hide", help="stop the display and hand the panel back"
+                   ).set_defaults(func=cmd_hide)
+    sub.add_parser("status", help="is the display running?"
+                   ).set_defaults(func=cmd_status)
+
     conf = sub.add_parser("config", help="show or change settings")
     conf.add_argument("--set", action="append", metavar="KEY=VALUE")
     conf.set_defaults(func=cmd_config)
@@ -412,6 +578,8 @@ def _add_display_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--panel", help="ili9486 | ili9488 | st7796 | st7789 | st7735")
     sp.add_argument("--night", help='dim hours, e.g. "22-7", or "off"')
     sp.add_argument("--palette", choices=["clinical", "cvd"])
+    sp.add_argument("--view", choices=["full", "minimal"])
+    sp.add_argument("--touch", help='"auto", "off", or /dev/input/eventN')
 
 
 def main(argv: list[str] | None = None) -> int:

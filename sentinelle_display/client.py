@@ -132,13 +132,17 @@ class Poller(threading.Thread):
         super().__init__(name="sentinelle-poller")
         self.cfg = cfg
         self.snapshot = Snapshot()
-        self._stop = threading.Event()
+        # NOT self._stop: threading.Thread already has a private _stop()
+        # method that join() calls internally, and shadowing it with an Event
+        # makes join() raise "'Event' object is not callable" -- from inside
+        # the standard library, on a line you did not write.
+        self._stopping = threading.Event()
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self._on_update = on_update
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stopping.set()
         self._wake.set()
 
     def refresh_now(self) -> None:
@@ -188,7 +192,7 @@ class Poller(threading.Thread):
 
     def run(self) -> None:
         backoff = 0
-        while not self._stop.is_set():
+        while not self._stopping.is_set():
             self._fetch_once()
             if self._on_update:
                 try:

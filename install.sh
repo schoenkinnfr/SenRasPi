@@ -105,7 +105,7 @@ if [[ $ENABLE_SPI -eq 1 ]]; then
   fi
 fi
 
-for grp in spi gpio video; do
+for grp in spi gpio video input; do
   if getent group "$grp" >/dev/null; then
     if id -nG "$RUN_USER" | tr ' ' '\n' | grep -qx "$grp"; then
       note "$RUN_USER already in group $grp"
@@ -137,10 +137,14 @@ After=network-online.target
 [Service]
 Type=simple
 User=__RUN_USER__
-SupplementaryGroups=spi gpio video
+SupplementaryGroups=spi gpio video input
 ExecStart=__VENV__/bin/sentinelle-display run
 Restart=always
 RestartSec=5
+# Exit code 64 is "the user held a finger on the screen to hide me". Without
+# this line Restart=always would bring it straight back five seconds later and
+# the gesture would look broken.
+RestartPreventExitStatus=64
 # A crash loop must not fill the SD card with journal. Cards are the usual
 # cause of a Pi that dies after three months; writes are the usual cause of a
 # dead card.
@@ -166,7 +170,13 @@ ReadWritePaths=-/home/__RUN_USER__/.config/sentinelle
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
-# /dev/fb*, /dev/spidev* and /dev/gpiochip* are the only devices it touches.
+# DeviceAllow is a WHITELIST: naming any device denies everything else, so a
+# device missing from this list fails with a bare EACCES that looks like a
+# permissions bug in the app. These are all of them.
+#   char-input     the touchscreen (/dev/input/eventN), read-only
+#   char-spi       the direct-SPI backend
+#   char-gpiochip  DC/RESET/backlight lines
+DeviceAllow=char-input r
 DeviceAllow=char-spi rw
 DeviceAllow=char-gpiochip rw
 DeviceAllow=/dev/fb0 rw
@@ -191,6 +201,63 @@ sudo -u "$RUN_USER" chmod 700 "$CONF_DIR"
 note "config directory: $CONF_DIR"
 
 # ─────────────────────────────────────────────────────────────────────────────
+say "Desktop integration"
+
+# Starting a system service normally needs root. Rather than make the menu
+# entry prompt for a password -- which on a launcher click just looks like
+# nothing happened -- allow exactly three commands on exactly this one unit.
+# Validated with visudo before installing: a malformed sudoers file locks you
+# out of sudo entirely, so this is never written unchecked.
+SUDOERS=/etc/sudoers.d/sentinelle-display
+SYSTEMCTL="$(command -v systemctl || echo /usr/bin/systemctl)"
+TMP_SUDOERS="$(mktemp)"
+cat > "$TMP_SUDOERS" <<SUDO
+# Lets ${RUN_USER} show/hide the glucose display without a password prompt.
+# Three exact commands on one unit -- not a general sudo grant.
+${RUN_USER} ALL=(root) NOPASSWD: ${SYSTEMCTL} start sentinelle-display, ${SYSTEMCTL} stop sentinelle-display, ${SYSTEMCTL} restart sentinelle-display
+SUDO
+if sudo visudo -cqf "$TMP_SUDOERS" 2>/dev/null; then
+  sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS"
+  note "sudoers rule installed (start/stop/restart only)"
+else
+  note "sudoers rule FAILED validation — skipped; 'show'/'hide' will prompt for a password"
+fi
+rm -f "$TMP_SUDOERS"
+
+# A menu entry, but only where a menu exists. On Raspberry Pi OS Lite there is
+# no desktop and dropping .desktop files would be litter.
+if [[ -d /usr/share/applications ]]; then
+  sudo tee /usr/share/applications/sentinelle-display.desktop >/dev/null <<'DESK'
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Sentinelle Glucose Display
+GenericName=Glucose Display
+Comment=Show the always-on glucose panel (hold a finger on the screen to hide it)
+Exec=sentinelle-display show
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;Monitor;
+Keywords=glucose;diabetes;cgm;sentinelle;
+StartupNotify=false
+DESK
+  sudo chmod 0644 /usr/share/applications/sentinelle-display.desktop
+  note "menu entry: Sentinelle Glucose Display (under Accessories)"
+
+  # ...and a shortcut on the desktop itself, if this user has one.
+  DESKTOP_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)/Desktop"
+  if [[ -d $DESKTOP_DIR ]]; then
+    sudo -u "$RUN_USER" cp /usr/share/applications/sentinelle-display.desktop "$DESKTOP_DIR/"
+    sudo -u "$RUN_USER" chmod +x "$DESKTOP_DIR/sentinelle-display.desktop"
+    note "desktop shortcut: $DESKTOP_DIR"
+  fi
+  command -v update-desktop-database >/dev/null && \
+    sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+else
+  note "no /usr/share/applications — no desktop here, skipping the menu entry"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 say "Done"
 
 if [[ $NEEDS_REBOOT -eq 1 ]]; then
@@ -212,7 +279,13 @@ cat <<EOF
 
       sentinelle-display probe          # confirm the panel is visible
       sentinelle-display pair           # type the code from Settings
-      sudo systemctl start sentinelle-display
+      sentinelle-display show           # start it
+
+    On the screen: tap to switch between the full and minimal views,
+    hold a finger down to hide it and hand the panel back. Bring it
+    back with the menu entry, or:
+
+      sentinelle-display show
 
     If the screen stays dark, start with:
 

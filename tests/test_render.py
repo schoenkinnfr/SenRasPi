@@ -250,3 +250,114 @@ def _daytime() -> float:
     into a wash test depending on when CI happens to run."""
     import datetime
     return datetime.datetime.now().replace(hour=14, minute=47, second=0).timestamp()
+
+
+# ── views and the on-screen button ──────────────────────────────────────────
+
+
+def test_minimal_view_renders_at_every_state():
+    for kind in ("in_range", "low", "high", "stale"):
+        img = R.render(cfg(night="off"), R.demo_snapshot(kind, now=_daytime()),
+                       now=_daytime(), view="minimal")
+        assert img.size == (480, 320)
+
+
+def test_minimal_view_still_names_the_state_in_words():
+    """The whole point of the state word is that colour is not the only
+    channel. Shrinking the layout must not quietly drop it."""
+    assert R.STATE_WORD["low"] == "LOW"
+    img_min = R.render(cfg(night="off"), R.demo_snapshot("low", now=_daytime()),
+                       now=_daytime(), view="minimal")
+    img_full = R.render(cfg(night="off"), R.demo_snapshot("low", now=_daytime()),
+                        now=_daytime(), view="full")
+    # Both views draw text in the lower third; neither is a bare number.
+    for img in (img_min, img_full):
+        lower = np.asarray(img.convert("L"))[210:, :]
+        assert lower.max() > 120
+
+
+def test_the_button_is_only_drawn_when_a_touchscreen_was_found():
+    """Drawing a button on a panel that cannot be tapped is worse than
+    drawing nothing — it advertises a control that does not exist."""
+    when = _daytime()
+    snap = R.demo_snapshot(now=when)
+    without = R.render(cfg(night="off"), snap, now=when, show_button=False)
+    with_btn = R.render(cfg(night="off"), snap, now=when, show_button=True)
+    assert np.asarray(without).tobytes() != np.asarray(with_btn).tobytes()
+    # ...and the difference is confined to the bottom-right corner.
+    a, b = np.asarray(without, dtype=int), np.asarray(with_btn, dtype=int)
+    diff = (a != b).any(axis=2)
+    assert not diff[:280, :400].any()
+    assert diff[290:, 420:].any()
+
+
+def test_night_wake_overrides_the_ambient_wash():
+    """A tap at 3am must show the real screen, not a slightly different wash."""
+    night = _at_hour(3)
+    snap = R.demo_snapshot(now=night)
+    washed = R.render(cfg(night="22-7"), snap, now=night)
+    woken = R.render(cfg(night="22-7"), snap, now=night, force_day=True)
+    assert np.asarray(washed).tobytes() != np.asarray(woken).tobytes()
+    # The wash is nearly uniform; the dashboard is not.
+    assert np.asarray(washed.convert("L")).std() < np.asarray(woken.convert("L")).std()
+
+
+def test_is_night_handles_windows_that_cross_midnight():
+    assert R.is_night(cfg(night="22-7"), _at_hour(23))
+    assert R.is_night(cfg(night="22-7"), _at_hour(3))
+    assert not R.is_night(cfg(night="22-7"), _at_hour(12))
+    assert not R.is_night(cfg(night="off"), _at_hour(3))
+    # A same-day window must not be treated as wrapping.
+    assert R.is_night(cfg(night="13-15"), _at_hour(14))
+    assert not R.is_night(cfg(night="13-15"), _at_hour(23))
+
+
+def test_config_rejects_an_unknown_view():
+    assert any("view must be" in p for p in cfg(view="graph").validate())
+
+
+def _at_hour(hour: int) -> float:
+    import datetime
+    return datetime.datetime.now().replace(hour=hour, minute=30, second=0).timestamp()
+
+
+# ── the hide gesture ────────────────────────────────────────────────────────
+
+
+def test_both_gestures_are_named_on_screen():
+    """"Hold to hide" is not a gesture anyone guesses, so it has to be
+    written down where the gesture lives."""
+    when = _daytime()
+    snap = R.demo_snapshot(now=when)
+    with_hide = R.render(cfg(night="off"), snap, now=when,
+                         show_button=True, can_hide=True)
+    without = R.render(cfg(night="off"), snap, now=when,
+                       show_button=True, can_hide=False)
+    a, b = np.asarray(with_hide, dtype=int), np.asarray(without, dtype=int)
+    assert (a != b).any(), "the hide chip must be visible when hiding works"
+    # ...and only in the bottom strip, never over the reading.
+    diff = (a != b).any(axis=2)
+    assert not diff[:285, :].any()
+
+
+def test_no_chips_at_all_without_a_touchscreen():
+    when = _daytime()
+    snap = R.demo_snapshot(now=when)
+    plain = R.render(cfg(night="off"), snap, now=when, show_button=False)
+    chipped = R.render(cfg(night="off"), snap, now=when, show_button=True)
+    assert np.asarray(plain).tobytes() != np.asarray(chipped).tobytes()
+
+
+def test_the_hidden_exit_code_matches_the_systemd_unit():
+    """EXIT_HIDDEN and RestartPreventExitStatus have to agree or the gesture
+    silently does nothing: the service exits and comes straight back."""
+    from pathlib import Path
+
+    from sentinelle_display import cli
+
+    unit = Path(__file__).resolve().parent.parent / "systemd" / "sentinelle-display.service"
+    installer = Path(__file__).resolve().parent.parent / "install.sh"
+    for f in (unit, installer):
+        if f.exists():
+            assert f"RestartPreventExitStatus={cli.EXIT_HIDDEN}" in f.read_text(), \
+                f"{f.name} does not prevent restart on exit {cli.EXIT_HIDDEN}"

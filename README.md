@@ -87,7 +87,7 @@ it. It is safe to re-run; every step checks before changing anything.
 
 It installs the Debian packages (`python3-pil`, `python3-numpy`,
 `python3-spidev`, `python3-gpiozero`, `python3-lgpio`), creates a venv at
-`/opt/sentinelle-display`, enables SPI, adds you to the `spi`/`gpio`/`video`
+`/opt/sentinelle-display`, enables SPI, adds you to the `spi`/`gpio`/`video`/`input`
 groups, and installs a systemd unit.
 
 **Deliberately apt, not pip,** for numpy and Pillow: from PyPI those build from
@@ -209,7 +209,73 @@ It is already enabled, so it comes back on every boot.
 
 ---
 
-## 6. Settings
+## 6. The two views
+
+Tap the screen to switch between them; **hold a finger down for 1.5 seconds to
+hide it** and hand the panel back to the desktop. Two small chips in the
+bottom-right corner name both gestures — `tap · less` and `hold · hide` — so
+neither has to be guessed.
+
+**Full** — glucose with trend arrow, 3-hour graph with the target band shaded,
+insulin on board, pump reservoir, battery, sensor age, 24-hour time in range.
+For standing in front of the screen.
+
+**Minimal** — the number at roughly twice the size, the trend arrow, the state
+in words, and how old the reading is. For reading from the other side of the
+room, where a 40px IOB figure is unreadable anyway.
+
+**A tap or hold anywhere on the glass counts**, not just on the chips. Mapping taps to a
+hit-region needs the panel's raw ADC range, which varies by board and drifts
+with temperature, so a real button either needs a calibration step or quietly
+stops working near the edges. With one control on the screen, "anywhere" is
+more robust and much easier to hit in the dark.
+
+**At night a tap wakes the screen instead of switching views.** Walking past at
+3am and touching the glass shows the real dashboard for 30 seconds, then it
+fades back to the ambient wash. It does not silently change a setting you would
+only discover in the morning.
+
+### Hiding and bringing it back
+
+A long press exits with status 64, and the systemd unit lists that under
+`RestartPreventExitStatus`, so it stays gone rather than restarting five
+seconds later. The panel is blanked on the way out — leaving the last frame up
+would show a number that is no longer being refreshed.
+
+To bring it back:
+
+- **The menu entry** — *Sentinelle Glucose Display*, under Accessories. There
+  is a matching shortcut on the desktop.
+- **`sentinelle-display show`** from any shell.
+- Or the long way, `sudo systemctl start sentinelle-display`.
+
+`install.sh` writes a sudoers rule permitting exactly `start`, `stop` and
+`restart` of this one unit without a password, so a single click on the
+launcher works. It is validated with `visudo` before being installed — a
+malformed sudoers file locks you out of `sudo` entirely. If validation fails
+the rule is skipped and `show` falls back to prompting.
+
+`sentinelle-display hide` and `sentinelle-display status` do what they say.
+
+On Raspberry Pi OS Lite there is no menu, so no `.desktop` file is written;
+`sentinelle-display show` is the way back.
+
+```bash
+sentinelle-display config --set view=minimal              # which view to start in
+sentinelle-display config --set night_wake_seconds=60
+sentinelle-display config --set touch=off                 # ignore the touchscreen
+sentinelle-display config --set touch=/dev/input/event3    # if auto-detect picks wrong
+```
+
+`sentinelle-display probe` lists every input device and marks the one it would
+use. If nothing is marked, set `touch` to the right `/dev/input/eventN` by hand.
+
+Reading the touchscreen needs membership of the `input` group. `install.sh`
+adds you, and it takes effect on the next **reboot**, not the next shell.
+
+---
+
+## 7. Settings
 
 ```bash
 sentinelle-display config                       # show everything
@@ -229,6 +295,9 @@ sudo systemctl restart sentinelle-display       # settings apply on restart
 | `palette` | `clinical` | `clinical` (red/green/amber) or `cvd` — see below |
 | `rotate` | `0` | `0`/`90`/`180`/`270`. See the note below. |
 | `backend` | `auto` | `auto`, `fb`, `spi`, `png` |
+| `touch` | `auto` | `auto`, `off`, or a literal `/dev/input/eventN` |
+| `view` | `full` | Which view to start in: `full` or `minimal` |
+| `night_wake_seconds` | `30` | How long a night-time tap shows the real screen. `0` disables |
 | `width` / `height` | `480` / `320` | The panel's **native** resolution |
 
 **Rotation.** `width`/`height` are the panel's native framebuffer size;
@@ -250,7 +319,7 @@ red/blue/amber set that separates under all three common types.
 
 ---
 
-## 7. When it does not work
+## 8. When it does not work
 
 Run `sentinelle-display probe` first. It answers most of these.
 
@@ -265,6 +334,11 @@ Run `sentinelle-display probe` first. It answers most of these.
 | `/dev/spidev0.0 does not exist` | SPI is not enabled. `sudo raspi-config nonint do_spi 0`, reboot. |
 | `Permission denied` on SPI or fb | Group change needs a **reboot**, not just a new shell. |
 | `access revoked or wrong scope` | The token was revoked in Settings, or the code was `ambient`-scoped. Generate a `Full dashboard` code and re-pair. |
+| It hides itself and comes straight back | `RestartPreventExitStatus=64` is missing from the unit. Re-run `./install.sh`. |
+| The menu entry does nothing when clicked | The sudoers rule did not install, so `sudo` is silently prompting where nothing can answer. Run `sentinelle-display show` in a terminal to see the real error. |
+| Tapping does nothing | `probe` says whether a touchscreen was found. If it was, you are probably not in the `input` group yet — that needs a **reboot**, not a new shell. |
+| No **more**/**less** chip | No touchscreen detected, so the button is deliberately not drawn. Advertising a control that does not exist is worse than omitting it. |
+| A plain colour wash with one small number | That is night mode, working. Check `timedatectl` — a Pi still on UTC thinks it is 4-5 hours later than you do. `config --set night=off` disables it. |
 | Screen fine, then dead after weeks | Almost always the microSD card. Use an A2-rated one. |
 | Random reboots | Underpowered supply. Use the official 27W. |
 
@@ -282,7 +356,7 @@ That split saves an evening.
 
 ---
 
-## 8. What this can and cannot see
+## 9. What this can and cannot see
 
 Pairing produces a **kiosk token**, stored in `~/.config/sentinelle/display.json`
 mode 600. It:
@@ -304,7 +378,7 @@ enumerate valid codes.
 
 ---
 
-## 9. Development
+## 10. Development
 
 The renderer touches no hardware and no network, so you can work on it from a
 laptop:
