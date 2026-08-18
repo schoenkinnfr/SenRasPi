@@ -300,10 +300,17 @@ ragweed) in grains/m³, no API key. Two properties matter:
 - **Europe only.** CAMS has no pollen over North America. This is also why the
   panel does *not* reuse the OpenClaw morning briefing's pollen: that pipeline
   reads pollen.com by US ZIP code and has no London coverage at all.
-- **Seasonal.** Out of season the API returns `null`, not `0`. Those are
-  different facts, so nulls are dropped and an empty response reads **"out of
-  season"** rather than showing a reassuring zero for a measurement nobody
-  took.
+- **Seasonal, and it signals that with zeros.** The docs say pollen is "only
+  available during pollen season", which reads like it returns `null` out of
+  season. Checked against the live API in August: it returns **`0.0` for every
+  dormant species**, not null. So the panel lists only species with a non-zero
+  count — a row reading `Alder 0` would spend one of three scarce rows saying
+  nothing. Nulls are still handled if they ever appear.
+
+The panel has three distinct empty states, and they are not interchangeable:
+**"none detected"** (measured, all zero), **"out of season"** (all null, not
+measured), and **"no data"** (the fetch failed). Collapsing them would turn a
+failed fetch into a reassuring all-clear.
 
 ### Reading it
 
@@ -335,8 +342,35 @@ nothing else changes. Pollen is fetched on its own thread every 30 minutes —
 CAMS publishes hourly at best — and a pollen outage can never disturb the
 glucose reading beside it.
 
-`sentinelle-display probe` prints the current counts, which is the quickest way
-to tell "out of season" from "not reachable".
+### Checking it from your laptop, before deploying
+
+`tools/pollen-check.py` is stdlib-only — no Pillow, no numpy — so it runs on
+macOS system Python with nothing installed, and it imports the *real* parsing
+code rather than a copy:
+
+```bash
+cd ~/Documents/Apps/SentinelleT1D/pi-display
+python3 tools/pollen-check.py                  # Edgware, the default
+python3 tools/pollen-check.py --raw            # ...and dump the raw JSON
+python3 tools/pollen-check.py --lat 51.5072 --lon -0.1276 --label London
+python3 tools/pollen-check.py --url https://your-host/pollen.json
+```
+
+It prints every field the panel reads, then what the panel will draw. Exit
+status is the quick answer:
+
+| Exit | Means |
+|---|---|
+| `0` | Real counts. Good to deploy. |
+| `1` | Reachable, every species null — out of season, or coordinates outside Europe. Correct behaviour, not a fault. |
+| `2` | Unreachable, or the response shape does not match what the parser expects. |
+
+The distinction between exit 1 and exit 2 is the point: a **null** field is the
+API correctly saying "not this time of year", while a **missing** field means
+the shape changed and no amount of waiting for spring will fix it. The script
+names which one you have.
+
+Once installed on the Pi, `sentinelle-display probe` prints the same counts.
 
 ---
 

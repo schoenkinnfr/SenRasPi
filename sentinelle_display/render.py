@@ -603,13 +603,23 @@ def _draw_pollen(draw, lay: Layout, pal: Palette, reading, x0: int) -> None:
         header = f"{header} · {int(age // 60)}H"
     _text(draw, (tx, y0 + lay.px(5)), header[:20], f_cap, pal.ink_3)
 
-    if reading is None or not reading.species:
-        why = "out of season" if (reading and reading.ok) else "no data"
+    rows = reading.detected if reading else []
+    if not rows:
+        # Three distinct situations, three different words. "none detected" is
+        # a measurement; "out of season" is the API declining to measure; "no
+        # data" is us failing to reach it. Collapsing them would turn a
+        # failed fetch into a reassuring all-clear.
+        if reading is None or not reading.ok:
+            why = "no data"
+        elif reading.species:
+            why = "none detected"
+        else:
+            why = "out of season"
         _text(draw, ((x0 + x1) // 2, (y0 + y1) // 2), why,
               f_row, pal.ink_3, anchor="mm")
         return
 
-    worst_name, worst_value, worst_band = reading.species[0]
+    worst_name, worst_value, worst_band = rows[0]
     _text(draw, (tx, y0 + lay.px(16)), worst_band, f_band, pal.ink)
 
     # The magnitude bar. Four steps, so it reads at a glance from the length
@@ -625,7 +635,7 @@ def _draw_pollen(draw, lay: Layout, pal: Palette, reading, x0: int) -> None:
     # Up to three species, worst first, each with its raw grains/m3 so the
     # number behind our banding is never hidden.
     ry = y0 + lay.px(46)
-    for name, value, _band in reading.species[:3]:
+    for name, value, _band in rows[:3]:
         _text(draw, (tx, ry), name.capitalize()[:8], f_row, pal.ink_2)
         _text(draw, (x1 - pad, ry), f"{value:.0f}", f_row, pal.ink_2, anchor="ra")
         ry += lay.px(13)

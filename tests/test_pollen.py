@@ -148,3 +148,33 @@ def test_a_fetch_failure_keeps_the_last_good_reading():
 def test_a_garbage_payload_does_not_raise():
     for junk in ({}, {"current": None}, {"current": {"grass_pollen": "n/a"}}):
         P.parse(junk if isinstance(junk, dict) else {}, "Edgware")
+
+
+# ── zeros are measurements, but not worth a row ─────────────────────────────
+
+
+def test_zero_counts_are_kept_as_data_but_not_shown():
+    """Checked against the live API: out of season it returns 0.0, NOT null —
+    the docs' "only available during pollen season" reads like null but isn't.
+    So the raw list is mostly zeros, and a panel row saying 'Alder 0' spends
+    one of three scarce rows saying nothing."""
+    r = P.parse(payload(alder=0.0, birch=0.0, grass=5.5,
+                        mugwort=2.8, olive=0.0, ragweed=0.0), "Edgware")
+    assert len(r.species) == 6                       # all six were measured
+    assert [n for n, _, _ in r.detected] == ["mugwort", "grass"]
+
+
+def test_all_zero_is_none_detected_not_out_of_season():
+    """Three different situations that must not collapse into one message:
+    all-zero is a measurement, all-null is the API declining to measure, and
+    a failed fetch is us not knowing either way."""
+    measured = P.parse(payload(**{s: 0.0 for s in P.SPECIES}), "Edgware")
+    assert measured.species and not measured.detected   # -> "none detected"
+
+    unmeasured = P.parse(payload(), "Edgware")
+    assert not unmeasured.species                        # -> "out of season"
+
+
+def test_worst_ignores_zeros_when_anything_is_present():
+    r = P.parse(payload(alder=0.0, grass=5.5), "Edgware")
+    assert r.worst[0] == "grass"

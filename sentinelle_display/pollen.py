@@ -12,10 +12,14 @@ Two things about that source you have to design around:
   * EUROPE ONLY. CAMS's pollen fields do not cover North America, which is
     also why this could not simply reuse the OpenClaw briefing's pollen: that
     pipeline reads pollen.com by US ZIP code and has no London coverage at all.
-  * SEASONAL. Outside a species' season the API returns null, not zero. Those
-    are different facts and the panel must not turn "not measured" into "none
-    detected" — so nulls are dropped, and a response with nothing in it says
-    "out of season" rather than showing a reassuring 0.
+  * SEASONAL, and it signals that with ZEROS. The docs say pollen is "only
+    available during pollen season", which reads like it returns null out of
+    season. Checked against the live API in August: it returns 0.0 for every
+    dormant species, not null. Both are handled — null is still treated as
+    "not measured" if it ever appears — but zero is the case that actually
+    happens, and it is why the panel filters zero-count species out of its
+    list. A row reading "Alder 0" spends one of three scarce rows saying
+    nothing.
 
 `allergy_url` in the config overrides the endpoint. Point it at an OpenClaw
 endpoint serving the same shape and this module needs no changes.
@@ -111,8 +115,19 @@ class PollenReading:
     last_error: str | None = None
 
     @property
+    def detected(self) -> list[tuple[str, float, str]]:
+        """Only species actually present. This is what the panel lists.
+
+        Out of season the API reports 0.0 for every dormant species, so the
+        raw list is mostly zeros. Showing them would fill the panel with rows
+        that carry no information and push a real reading off the bottom.
+        """
+        return [r for r in self.species if r[1] > 0]
+
+    @property
     def worst(self) -> tuple[str, float, str] | None:
-        return self.species[0] if self.species else None
+        rows = self.detected or self.species
+        return rows[0] if rows else None
 
     @property
     def age_minutes(self) -> float | None:
