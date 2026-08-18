@@ -147,7 +147,17 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/${RUN_USER}/.config/sentinelle /tmp
+# The leading '-' matters. Without it systemd refuses to start the unit at
+# all when this directory does not exist yet -- i.e. on every fresh install,
+# before the first `sentinelle-display pair`. The failure is a cryptic
+# "Failed to set up mount namespacing ... status=226/NAMESPACE" that never
+# reaches the program, so the display crash-loops instead of showing its
+# "not paired yet" screen, which is the exact situation that screen exists
+# for. install.sh also pre-creates the directory; this makes it survive
+# someone deleting it.
+# /tmp is not listed: PrivateTmp=yes already gives this unit its own writable
+# /tmp, and naming it here would only re-expose the host's.
+ReadWritePaths=-/home/${RUN_USER}/.config/sentinelle
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
@@ -164,6 +174,15 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable sentinelle-display >/dev/null
 note "enabled — it will start on boot"
+
+# Create the config directory up front, owned by the user who will run
+# `pair`. The service reads its config from here and systemd wants the path
+# to exist; creating it now means a fresh Pi shows the "not paired yet"
+# screen instead of a crash loop.
+CONF_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)/.config/sentinelle"
+sudo -u "$RUN_USER" mkdir -p "$CONF_DIR"
+sudo -u "$RUN_USER" chmod 700 "$CONF_DIR"
+note "config directory: $CONF_DIR"
 
 # ─────────────────────────────────────────────────────────────────────────────
 say "Done"

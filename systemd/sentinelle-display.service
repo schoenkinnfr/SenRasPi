@@ -24,7 +24,10 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/pi/.config/sentinelle /tmp
+# The leading '-' lets the unit start before the directory exists (i.e.
+# before the first `pair`). Without it systemd fails with 226/NAMESPACE
+# and the display crash-loops instead of showing its "not paired" screen.
+ReadWritePaths=-/home/pi/.config/sentinelle
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes
