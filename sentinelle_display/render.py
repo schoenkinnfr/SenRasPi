@@ -42,6 +42,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image, ImageDraw
@@ -165,9 +166,10 @@ def render(
     snap: Snapshot,
     now: float | None = None,
     view: str = "full",
-    show_button: bool = False,
+    state: dict | None = None,
+    bar: bool = False,
+    hint: bool = False,
     force_day: bool = False,
-    can_hide: bool = True,
 ) -> Image.Image:
     """The whole screen. Never raises — a renderer that throws leaves a Pi
     showing a frozen frame with no clue why, so failures are drawn instead.
@@ -179,9 +181,13 @@ def render(
     walking past at 3am and touching the glass shows you the real screen for
     a few seconds before it fades back.
 
-    `show_button` is passed by the caller rather than read from cfg because
-    only the caller knows whether a touchscreen was actually FOUND. Drawing a
-    button on a panel that cannot be tapped is worse than drawing nothing.
+    `state` is the live, runtime-mutable view/night_mode/units the control bar
+    reflects and changes. It is separate from cfg because the buttons change
+    what is on screen now without rewriting the config file on disk.
+
+    `bar` draws the control bar; `hint` draws the small dotted chip that says
+    the bar exists. Both are decided by the caller, because only the caller
+    knows whether this output can actually be clicked.
     """
     now = now or time.time()
     lay = Layout(*_logical_size(cfg))
@@ -198,26 +204,35 @@ def render(
 
     pal = STALE if stale else palette(getattr(cfg, "palette", "clinical"))
 
-    if is_night(cfg, now) and not force_day:
-        return _render_night(cfg, lay, pal, d, stale)
+    state = state or {}
+    if is_night(cfg, now, state.get("night_mode")) and not force_day:
+        # The bar has to survive the wash. Without this, setting NIGHT to "On"
+        # would hide the very control needed to set it back -- a one-way door
+        # you could only escape over SSH.
+        return _render_night(cfg, lay, pal, d, stale, cfg_state=state,
+                             bar=bar, hint=hint, view=view)
 
     img = Image.new("RGB", (lay.w, lay.h), pal.bg)
     draw = ImageDraw.Draw(img)
 
-    if view == "minimal":
-        _draw_minimal(draw, lay, pal, cfg, d, stale, now)
-    else:
-        _draw_hero(draw, lay, pal, cfg, d, stale)
-        _draw_rail(draw, lay, pal, cfg, d)
-        _draw_trend(draw, lay, pal, cfg, d, now)
-        _draw_footer(draw, lay, pal, cfg, d, snap, now)
+    # Reserve the bar's strip so the dashboard is drawn into the space that
+    # is actually left, rather than under a bar that then covers it.
+    content = Layout(lay.w, lay.h - (lay.px(BAR_H) if bar else 0))
+    content.w, content.h = lay.w, lay.h - (lay.px(BAR_H) if bar else 0)
 
-    # The button is drawn LAST so it is never covered. It is an affordance,
-    # not the hit target — a tap anywhere on the glass toggles the view (see
-    # touch.py for why). Without something visible, a screen showing one big
-    # number gives no hint that a dashboard exists behind it.
-    if show_button:
-        _draw_view_button(draw, lay, pal, view, can_hide=can_hide)
+    if view == "minimal":
+        _draw_minimal(draw, content, pal, cfg, d, stale, now)
+    else:
+        _draw_hero(draw, content, pal, cfg, d, stale)
+        _draw_rail(draw, content, pal, cfg, d)
+        _draw_trend(draw, content, pal, cfg, d, now)
+        _draw_footer(draw, content, pal, cfg, d, snap, now)
+
+    # Drawn LAST so nothing covers the controls.
+    if bar:
+        _draw_bar(draw, lay, pal, button_layout(cfg, {**state, "view": view}, lay.w, lay.h))
+    elif hint:
+        _draw_bar_hint(draw, lay, pal)
 
     if snap.offline:
         _draw_offline_banner(draw, lay, pal, snap)
@@ -263,6 +278,104 @@ def _orient(img: Image.Image, cfg) -> Image.Image:
     if not cfg.rotate:
         return img
     return img.rotate(-cfg.rotate, expand=True)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The control bar.
+#
+# Geometry lives in ONE function, button_layout(), which both the renderer and
+# the click handler call. Drawing buttons in one place and hit-testing them in
+# another is how you get a control that visibly moves but still responds where
+# it used to be -- and on a touchscreen that is indistinguishable from broken
+# hardware.
+#
+# The bar is not permanent. An always-on display should mostly be the reading,
+# so it appears on a tap and hides itself again a few seconds later. A small
+# dotted chip in the corner is the standing hint that it exists.
+
+
+BAR_H = 44          # reference-space height
+N_BUTTONS = 4
+
+
+@dataclass(frozen=True)
+class Button:
+    key: str        # "view" | "night" | "units" | "minimize"
+    caption: str    # small label above
+    value: str      # current state, or the action for minimize
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+    def contains(self, x: float, y: float) -> bool:
+        return self.x0 <= x <= self.x1 and self.y0 <= y <= self.y1
+
+
+def button_layout(cfg, state: dict, w: int, h: int) -> list[Button]:
+    """The bar's buttons with their real pixel rects, for the CURRENT state.
+
+    `state` carries the live values the buttons reflect: view, night_mode and
+    units. They are passed in rather than read off cfg because the buttons
+    change things at runtime without rewriting the config file.
+    """
+    lay = Layout(w, h)
+    bar_h = lay.px(BAR_H)
+    y0, y1 = h - bar_h, h
+    step = w / N_BUTTONS
+
+    night = {"auto": "Auto", "on": "On", "off": "Off"}.get(state.get("night_mode", "auto"), "Auto")
+    specs = [
+        ("view", "VIEW", "Minimal" if state.get("view") == "minimal" else "Full"),
+        ("night", "NIGHT", night),
+        ("units", "UNITS", "mmol/L" if state.get("units") == "mmol" else "mg/dL"),
+        ("minimize", "", "Minimize"),
+    ]
+    return [
+        Button(key, cap, val, round(i * step), y0, round((i + 1) * step) - 1, y1)
+        for i, (key, cap, val) in enumerate(specs)
+    ]
+
+
+def hit_test(buttons: list[Button], x: float, y: float) -> str | None:
+    for b in buttons:
+        if b.contains(x, y):
+            return b.key
+    return None
+
+
+def _draw_bar(draw, lay: Layout, pal: Palette, buttons: list[Button]) -> None:
+    if not buttons:
+        return
+    y0 = buttons[0].y0
+    draw.rectangle([0, y0, lay.w, lay.h], fill=pal.panel)
+    draw.line([(0, y0), (lay.w, y0)], fill=pal.rule, width=lay.px(1))
+
+    f_cap = font("regular", lay.pt(9))
+    f_val = font("bold", lay.pt(13))
+    for i, b in enumerate(buttons):
+        if i:                                   # hairline between buttons
+            draw.line([(b.x0, y0 + lay.px(6)), (b.x0, lay.h - lay.px(6))],
+                      fill=pal.rule, width=lay.px(1))
+        cx = (b.x0 + b.x1) // 2
+        if b.caption:
+            _text(draw, (cx, y0 + lay.px(9)), b.caption, f_cap, pal.ink_3, anchor="mm")
+            _text(draw, (cx, y0 + lay.px(28)), b.value, f_val, pal.ink, anchor="mm")
+        else:
+            _text(draw, (cx, (y0 + lay.h) // 2), b.value, f_val, pal.ink_2, anchor="mm")
+
+
+def _draw_bar_hint(draw, lay: Layout, pal: Palette) -> None:
+    """The standing affordance while the bar is hidden. Deliberately tiny --
+    an ambient screen should mostly be the number."""
+    w, h = lay.px(30), lay.px(16)
+    x1, y1 = lay.w - lay.px(6), lay.h - lay.px(5)
+    x0, y0 = x1 - w, y1 - h
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=lay.px(4),
+                           fill=pal.panel, outline=pal.rule, width=lay.px(1))
+    _text(draw, ((x0 + x1) // 2, (y0 + y1) // 2 - lay.px(1)), "•••",
+          font("bold", lay.pt(10)), pal.ink_3, anchor="mm")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,7 +742,24 @@ def _draw_offline_banner(draw, lay: Layout, pal: Palette, snap: Snapshot) -> Non
 # Night mode and the empty state.
 
 
-def is_night(cfg, now: float) -> bool:
+def is_night(cfg, now: float, mode: str | None = None) -> bool:
+    """Is the ambient wash showing?
+
+    `mode` is the runtime override from the NIGHT button:
+        "on"    force the wash regardless of the clock
+        "off"   never wash
+        "auto"  follow the configured schedule (the default)
+
+    Three-way rather than a toggle on purpose. A plain on/off switch replaces
+    the schedule with something you have to remember to flip twice a day, and
+    the failure mode is a bedroom screen at full brightness all night because
+    you forgot.
+    """
+    mode = mode or getattr(cfg, "night_mode", "auto")
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
     win = cfg.night_window
     if not win:
         return False
@@ -638,7 +768,9 @@ def is_night(cfg, now: float) -> bool:
     return (a <= hour or hour < b) if a > b else (a <= hour < b)
 
 
-def _render_night(cfg, lay: Layout, pal: Palette, d: dict, stale: bool) -> Image.Image:
+def _render_night(cfg, lay: Layout, pal: Palette, d: dict, stale: bool,
+                  cfg_state: dict | None = None, bar: bool = False,
+                  hint: bool = False, view: str = "full") -> Image.Image:
     """A dim wash plus a small number. A full dashboard at 3am is not what
     anyone wants, and a bright panel in a bedroom is worse than no panel."""
     mgdl = d.get("mgdl")
@@ -646,13 +778,27 @@ def _render_night(cfg, lay: Layout, pal: Palette, d: dict, stale: bool) -> Image
     wash = _mix((0, 0, 0), pal.for_state(state), 0.10 if state == "in_range" else 0.22)
     img = Image.new("RGB", (lay.w, lay.h), wash)
     draw = ImageDraw.Draw(img)
+    # Lift the number clear of whatever occupies the bottom edge. A reading
+    # half-covered by its own control bar is worse than no control bar.
+    inset = lay.px(BAR_H) if bar else (lay.px(24) if hint else 0)
+
     value = _fmt_value(mgdl, cfg.units)
-    _text(draw, (lay.w - lay.px(18), lay.h - lay.px(14)), value,
+    _text(draw, (lay.w - lay.px(18), lay.h - lay.px(14) - inset), value,
           font("condensed", lay.pt(46)),
           _mix(wash, pal.ink, 0.55), anchor="rs")
     if stale:
-        _text(draw, (lay.px(18), lay.h - lay.px(16)), "stale",
+        _text(draw, (lay.px(18), lay.h - lay.px(16) - inset), "stale",
               font("regular", lay.pt(14)), _mix(wash, pal.ink, 0.35), anchor="ls")
+
+    # The bar has to survive the wash. Without it, setting NIGHT to "On" would
+    # hide the only control that can set it back — a one-way door you could
+    # escape from only over SSH.
+    if bar:
+        _draw_bar(draw, lay, pal,
+                  button_layout(cfg, {**(cfg_state or {}), "view": view}, lay.w, lay.h))
+    elif hint:
+        _draw_bar_hint(draw, lay, pal)
+
     return _orient(img, cfg)
 
 

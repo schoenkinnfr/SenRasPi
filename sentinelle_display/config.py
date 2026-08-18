@@ -74,6 +74,9 @@ class Config:
     # hit-region.
     touch: str = "auto"
     view: str = "full"           # "full" dashboard | "minimal" big number
+    # Runtime override for the ambient wash, changed by the NIGHT button:
+    # "auto" follows the `night` schedule, "on"/"off" force it either way.
+    night_mode: str = "auto"
     # A tap during the night window shows the real screen for this long before
     # fading back to the ambient wash. 0 disables the wake.
     night_wake_seconds: int = 30
@@ -110,6 +113,8 @@ class Config:
             problems.append(f"units must be mgdl or mmol (got {self.units!r})")
         if not 1 <= self.hours <= 12:
             problems.append(f"hours must be between 1 and 12 (got {self.hours})")
+        if self.night_mode not in ("auto", "on", "off"):
+            problems.append(f"night_mode must be auto, on or off (got {self.night_mode!r})")
         if self.view not in ("full", "minimal"):
             problems.append(f"view must be full or minimal (got {self.view!r})")
         if self.rotate not in (0, 90, 180, 270):

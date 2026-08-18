@@ -52,6 +52,15 @@ say "Installing system packages"
 # talk to a Pi 5's GPIO at all — RPi.GPIO does not work on this board.
 PKGS=(python3 python3-venv python3-pip python3-pil python3-numpy
       python3-spidev python3-gpiozero python3-lgpio fonts-dejavu-core)
+# Only needed for the window backend, and only meaningful where a desktop
+# exists. Skipped on Lite so a headless panel does not pull in Tcl/Tk.
+if [[ -d /usr/share/xsessions || -d /usr/share/wayland-sessions ]] \
+   || dpkg -s raspberrypi-ui-mods >/dev/null 2>&1; then
+  PKGS+=(python3-tk python3-pil.imagetk)
+  HAS_DESKTOP=1
+else
+  HAS_DESKTOP=0
+fi
 
 MISSING=()
 for p in "${PKGS[@]}"; do
@@ -188,8 +197,18 @@ UNIT
 sudo sed -i "s|__RUN_USER__|${RUN_USER}|g; s|__VENV__|${VENV}|g" "$SERVICE"
 
 sudo systemctl daemon-reload
-sudo systemctl enable sentinelle-display >/dev/null
-note "enabled — it will start on boot"
+
+# On a DESKTOP the display must run inside the desktop session, not as a
+# system service: systemd units have no DISPLAY or WAYLAND_DISPLAY, so a
+# window backend started that way cannot open a window at all. The desktop's
+# own autostart gives it the right environment for free.
+if [[ $HAS_DESKTOP -eq 1 ]]; then
+  sudo systemctl disable sentinelle-display >/dev/null 2>&1 || true
+  note "desktop detected — starting from the desktop session, not systemd"
+else
+  sudo systemctl enable sentinelle-display >/dev/null
+  note "enabled — it will start on boot"
+fi
 
 # Create the config directory up front, owned by the user who will run
 # `pair`. The service reads its config from here and systemd wants the path
@@ -234,7 +253,7 @@ Version=1.0
 Name=Sentinelle Glucose Display
 GenericName=Glucose Display
 Comment=Show the always-on glucose panel (hold a finger on the screen to hide it)
-Exec=sentinelle-display show
+Exec=sentinelle-display run
 Icon=utilities-system-monitor
 Terminal=false
 Categories=Utility;Monitor;
@@ -251,6 +270,20 @@ DESK
     sudo -u "$RUN_USER" chmod +x "$DESKTOP_DIR/sentinelle-display.desktop"
     note "desktop shortcut: $DESKTOP_DIR"
   fi
+  # Start it with the desktop session. This is what replaces the systemd unit
+  # on a Desktop image.
+  AUTOSTART_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)/.config/autostart"
+  sudo -u "$RUN_USER" mkdir -p "$AUTOSTART_DIR"
+  sudo -u "$RUN_USER" tee "$AUTOSTART_DIR/sentinelle-display.desktop" >/dev/null <<'AUTO'
+[Desktop Entry]
+Type=Application
+Name=Sentinelle Glucose Display
+Exec=sentinelle-display run
+Terminal=false
+X-GNOME-Autostart-enabled=true
+AUTO
+  note "autostart: $AUTOSTART_DIR"
+
   command -v update-desktop-database >/dev/null && \
     sudo update-desktop-database /usr/share/applications 2>/dev/null || true
 else
@@ -279,13 +312,15 @@ cat <<EOF
 
       sentinelle-display probe          # confirm the panel is visible
       sentinelle-display pair           # type the code from Settings
-      sentinelle-display show           # start it
+      sentinelle-display run            # start it
 
-    On the screen: tap to switch between the full and minimal views,
-    hold a finger down to hide it and hand the panel back. Bring it
-    back with the menu entry, or:
+    On the screen: touch anywhere to bring up the control bar, then
+    press VIEW, NIGHT, UNITS or Minimize. The bar hides itself after
+    a few seconds; the small ••• chip in the corner is the reminder
+    that it is there.
 
-      sentinelle-display show
+    On a desktop it starts automatically with your session, and there
+    is a menu entry under Accessories.
 
     If the screen stays dark, start with:
 

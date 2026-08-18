@@ -276,19 +276,120 @@ def test_minimal_view_still_names_the_state_in_words():
         assert lower.max() > 120
 
 
-def test_the_button_is_only_drawn_when_a_touchscreen_was_found():
-    """Drawing a button on a panel that cannot be tapped is worse than
-    drawing nothing — it advertises a control that does not exist."""
+def test_night_wake_overrides_the_ambient_wash():
+    """A tap at 3am must show the real screen, not a slightly different wash."""
+    night = _at_hour(3)
+    snap = R.demo_snapshot(now=night)
+    washed = R.render(cfg(night="22-7"), snap, now=night)
+    woken = R.render(cfg(night="22-7"), snap, now=night, force_day=True)
+    assert np.asarray(washed).tobytes() != np.asarray(woken).tobytes()
+    # The wash is nearly uniform; the dashboard is not.
+    assert np.asarray(washed.convert("L")).std() < np.asarray(woken.convert("L")).std()
+
+
+def test_is_night_handles_windows_that_cross_midnight():
+    assert R.is_night(cfg(night="22-7"), _at_hour(23))
+    assert R.is_night(cfg(night="22-7"), _at_hour(3))
+    assert not R.is_night(cfg(night="22-7"), _at_hour(12))
+    assert not R.is_night(cfg(night="off"), _at_hour(3))
+    # A same-day window must not be treated as wrapping.
+    assert R.is_night(cfg(night="13-15"), _at_hour(14))
+    assert not R.is_night(cfg(night="13-15"), _at_hour(23))
+
+
+def test_config_rejects_an_unknown_view():
+    assert any("view must be" in p for p in cfg(view="graph").validate())
+
+
+def _at_hour(hour: int) -> float:
+    import datetime
+    return datetime.datetime.now().replace(hour=hour, minute=30, second=0).timestamp()
+
+
+# ── the control bar ─────────────────────────────────────────────────────────
+
+
+BAR_STATE = {"view": "full", "night_mode": "auto", "units": "mgdl"}
+
+
+def test_buttons_tile_the_full_width_without_gaps_or_overlap():
+    """A dead strip between two buttons is a press that does nothing, which on
+    a touchscreen is indistinguishable from a broken panel."""
+    bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
+    assert [b.key for b in bs] == ["view", "night", "units", "minimize"]
+    assert bs[0].x0 == 0
+    assert bs[-1].x1 == 479
+    for left, right in zip(bs, bs[1:]):
+        assert right.x0 == left.x1 + 1, f"gap/overlap between {left.key} and {right.key}"
+
+
+def test_every_pixel_of_the_bar_hits_exactly_one_button():
+    bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
+    y = (bs[0].y0 + bs[0].y1) // 2
+    for x in range(0, 480):
+        assert R.hit_test(bs, x, y) is not None, f"x={x} hits nothing"
+    # ...and nothing above the bar responds.
+    assert R.hit_test(bs, 240, bs[0].y0 - 1) is None
+
+
+def test_hit_regions_follow_the_panel_size():
+    """The bar is drawn from button_layout and hit-tested from button_layout.
+    If it ever stopped scaling, clicks would land where the buttons used to
+    be — visibly moved, still responding at the old coordinates."""
+    for w, h in ((480, 320), (320, 240), (800, 480)):
+        bs = R.button_layout(cfg(), BAR_STATE, w, h)
+        assert bs[0].x0 == 0 and bs[-1].x1 == w - 1
+        assert bs[0].y1 == h
+        assert R.hit_test(bs, w // 2, h - 2) is not None
+
+
+def test_button_labels_report_the_current_state_not_the_action():
+    """Mixing "what this is" and "what this does" across one row of buttons is
+    how you get a NIGHT button nobody can read."""
+    def val(state, key):
+        return next(b.value for b in R.button_layout(cfg(), state, 480, 320) if b.key == key)
+
+    assert val({**BAR_STATE, "night_mode": "auto"}, "night") == "Auto"
+    assert val({**BAR_STATE, "night_mode": "on"}, "night") == "On"
+    assert val({**BAR_STATE, "night_mode": "off"}, "night") == "Off"
+    assert val({**BAR_STATE, "view": "minimal"}, "view") == "Minimal"
+    assert val({**BAR_STATE, "units": "mmol"}, "units") == "mmol/L"
+
+
+def test_night_mode_override_beats_the_schedule_both_ways():
+    noon, small_hours = _at_hour(12), _at_hour(3)
+    assert R.is_night(cfg(night="22-7"), noon, "on")
+    assert not R.is_night(cfg(night="22-7"), small_hours, "off")
+    assert R.is_night(cfg(night="22-7"), small_hours, "auto")
+    assert not R.is_night(cfg(night="22-7"), noon, "auto")
+
+
+def test_the_bar_survives_night_mode():
+    """Setting NIGHT to On must not hide the control that sets it back —
+    that would be a one-way door escapable only over SSH."""
+    night = _at_hour(3)
+    snap = R.demo_snapshot(now=night)
+    state = {**BAR_STATE, "night_mode": "on"}
+    washed = R.render(cfg(), snap, now=night, state=state, bar=False)
+    with_bar = R.render(cfg(), snap, now=night, state=state, bar=True)
+    assert np.asarray(washed).tobytes() != np.asarray(with_bar).tobytes()
+    # The bar occupies the bottom strip in both the wash and the dashboard.
+    a, b = np.asarray(washed, dtype=int), np.asarray(with_bar, dtype=int)
+    assert (a != b).any(axis=2)[280:, :].any()
+
+
+def test_the_bar_does_not_cover_the_reading():
+    """The dashboard is drawn into the space left over, not underneath."""
     when = _daytime()
     snap = R.demo_snapshot(now=when)
-    without = R.render(cfg(night="off"), snap, now=when, show_button=False)
-    with_btn = R.render(cfg(night="off"), snap, now=when, show_button=True)
-    assert np.asarray(without).tobytes() != np.asarray(with_btn).tobytes()
-    # ...and the difference is confined to the bottom-right corner.
-    a, b = np.asarray(without, dtype=int), np.asarray(with_btn, dtype=int)
-    diff = (a != b).any(axis=2)
-    assert not diff[:280, :400].any()
-    assert diff[290:, 420:].any()
+    with_bar = R.render(cfg(night="off"), snap, now=when, state=BAR_STATE, bar=True)
+    # The hero number still has to be there, at full saturation.
+    top = np.asarray(with_bar.convert("RGB"), dtype=int)[:160, :]
+    assert (top.max(axis=2) - top.min(axis=2)).max() > 60
+
+
+def test_config_rejects_an_unknown_night_mode():
+    assert any("night_mode must be" in p for p in cfg(night_mode="sometimes").validate())
 
 
 def test_night_wake_overrides_the_ambient_wash():
@@ -321,31 +422,125 @@ def _at_hour(hour: int) -> float:
     return datetime.datetime.now().replace(hour=hour, minute=30, second=0).timestamp()
 
 
-# ── the hide gesture ────────────────────────────────────────────────────────
+def _at_hour(hour: int) -> float:
+    import datetime
+    return datetime.datetime.now().replace(hour=hour, minute=30, second=0).timestamp()
 
 
-def test_both_gestures_are_named_on_screen():
-    """"Hold to hide" is not a gesture anyone guesses, so it has to be
-    written down where the gesture lives."""
+# ── the control bar ─────────────────────────────────────────────────────────
+
+
+BAR_STATE = {"view": "full", "night_mode": "auto", "units": "mgdl"}
+
+
+def test_buttons_tile_the_full_width_without_gaps_or_overlap():
+    """A dead strip between two buttons is a press that does nothing, which on
+    a touchscreen is indistinguishable from a broken panel."""
+    bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
+    assert [b.key for b in bs] == ["view", "night", "units", "minimize"]
+    assert bs[0].x0 == 0
+    assert bs[-1].x1 == 479
+    for left, right in zip(bs, bs[1:]):
+        assert right.x0 == left.x1 + 1, f"gap/overlap between {left.key} and {right.key}"
+
+
+def test_every_pixel_of_the_bar_hits_exactly_one_button():
+    bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
+    y = (bs[0].y0 + bs[0].y1) // 2
+    for x in range(0, 480):
+        assert R.hit_test(bs, x, y) is not None, f"x={x} hits nothing"
+    # ...and nothing above the bar responds.
+    assert R.hit_test(bs, 240, bs[0].y0 - 1) is None
+
+
+def test_hit_regions_follow_the_panel_size():
+    """The bar is drawn from button_layout and hit-tested from button_layout.
+    If it ever stopped scaling, clicks would land where the buttons used to
+    be — visibly moved, still responding at the old coordinates."""
+    for w, h in ((480, 320), (320, 240), (800, 480)):
+        bs = R.button_layout(cfg(), BAR_STATE, w, h)
+        assert bs[0].x0 == 0 and bs[-1].x1 == w - 1
+        assert bs[0].y1 == h
+        assert R.hit_test(bs, w // 2, h - 2) is not None
+
+
+def test_button_labels_report_the_current_state_not_the_action():
+    """Mixing "what this is" and "what this does" across one row of buttons is
+    how you get a NIGHT button nobody can read."""
+    def val(state, key):
+        return next(b.value for b in R.button_layout(cfg(), state, 480, 320) if b.key == key)
+
+    assert val({**BAR_STATE, "night_mode": "auto"}, "night") == "Auto"
+    assert val({**BAR_STATE, "night_mode": "on"}, "night") == "On"
+    assert val({**BAR_STATE, "night_mode": "off"}, "night") == "Off"
+    assert val({**BAR_STATE, "view": "minimal"}, "view") == "Minimal"
+    assert val({**BAR_STATE, "units": "mmol"}, "units") == "mmol/L"
+
+
+def test_night_mode_override_beats_the_schedule_both_ways():
+    noon, small_hours = _at_hour(12), _at_hour(3)
+    assert R.is_night(cfg(night="22-7"), noon, "on")
+    assert not R.is_night(cfg(night="22-7"), small_hours, "off")
+    assert R.is_night(cfg(night="22-7"), small_hours, "auto")
+    assert not R.is_night(cfg(night="22-7"), noon, "auto")
+
+
+def test_the_bar_survives_night_mode():
+    """Setting NIGHT to On must not hide the control that sets it back —
+    that would be a one-way door escapable only over SSH."""
+    night = _at_hour(3)
+    snap = R.demo_snapshot(now=night)
+    state = {**BAR_STATE, "night_mode": "on"}
+    washed = R.render(cfg(), snap, now=night, state=state, bar=False)
+    with_bar = R.render(cfg(), snap, now=night, state=state, bar=True)
+    assert np.asarray(washed).tobytes() != np.asarray(with_bar).tobytes()
+    # The bar occupies the bottom strip in both the wash and the dashboard.
+    a, b = np.asarray(washed, dtype=int), np.asarray(with_bar, dtype=int)
+    assert (a != b).any(axis=2)[280:, :].any()
+
+
+def test_the_bar_does_not_cover_the_reading():
+    """The dashboard is drawn into the space left over, not underneath."""
     when = _daytime()
     snap = R.demo_snapshot(now=when)
-    with_hide = R.render(cfg(night="off"), snap, now=when,
-                         show_button=True, can_hide=True)
-    without = R.render(cfg(night="off"), snap, now=when,
-                       show_button=True, can_hide=False)
-    a, b = np.asarray(with_hide, dtype=int), np.asarray(without, dtype=int)
-    assert (a != b).any(), "the hide chip must be visible when hiding works"
-    # ...and only in the bottom strip, never over the reading.
-    diff = (a != b).any(axis=2)
-    assert not diff[:285, :].any()
+    with_bar = R.render(cfg(night="off"), snap, now=when, state=BAR_STATE, bar=True)
+    # The hero number still has to be there, at full saturation.
+    top = np.asarray(with_bar.convert("RGB"), dtype=int)[:160, :]
+    assert (top.max(axis=2) - top.min(axis=2)).max() > 60
 
 
-def test_no_chips_at_all_without_a_touchscreen():
-    when = _daytime()
-    snap = R.demo_snapshot(now=when)
-    plain = R.render(cfg(night="off"), snap, now=when, show_button=False)
-    chipped = R.render(cfg(night="off"), snap, now=when, show_button=True)
-    assert np.asarray(plain).tobytes() != np.asarray(chipped).tobytes()
+def test_config_rejects_an_unknown_night_mode():
+    assert any("night_mode must be" in p for p in cfg(night_mode="sometimes").validate())
+
+
+def test_night_wake_overrides_the_ambient_wash():
+    """A tap at 3am must show the real screen, not a slightly different wash."""
+    night = _at_hour(3)
+    snap = R.demo_snapshot(now=night)
+    washed = R.render(cfg(night="22-7"), snap, now=night)
+    woken = R.render(cfg(night="22-7"), snap, now=night, force_day=True)
+    assert np.asarray(washed).tobytes() != np.asarray(woken).tobytes()
+    # The wash is nearly uniform; the dashboard is not.
+    assert np.asarray(washed.convert("L")).std() < np.asarray(woken.convert("L")).std()
+
+
+def test_is_night_handles_windows_that_cross_midnight():
+    assert R.is_night(cfg(night="22-7"), _at_hour(23))
+    assert R.is_night(cfg(night="22-7"), _at_hour(3))
+    assert not R.is_night(cfg(night="22-7"), _at_hour(12))
+    assert not R.is_night(cfg(night="off"), _at_hour(3))
+    # A same-day window must not be treated as wrapping.
+    assert R.is_night(cfg(night="13-15"), _at_hour(14))
+    assert not R.is_night(cfg(night="13-15"), _at_hour(23))
+
+
+def test_config_rejects_an_unknown_view():
+    assert any("view must be" in p for p in cfg(view="graph").validate())
+
+
+def _at_hour(hour: int) -> float:
+    import datetime
+    return datetime.datetime.now().replace(hour=hour, minute=30, second=0).timestamp()
 
 
 def test_the_hidden_exit_code_matches_the_systemd_unit():

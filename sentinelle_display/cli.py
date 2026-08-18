@@ -138,130 +138,167 @@ def cmd_run(args) -> int:
             _err(f"config: {p}")
         return EXIT_CONFIG
 
+    # Live, runtime-mutable state. Separate from cfg because the control bar
+    # changes what is on screen NOW; `config --set` is what changes the file.
+    state = {
+        "view": cfg.view if cfg.view in renderer.VIEWS else "full",
+        "night_mode": cfg.night_mode,
+        "units": cfg.units,
+    }
+    ui = {"bar_until": 0.0, "wake_until": 0.0, "quit": False, "backend": None}
+    BAR_SECONDS = 8.0
+
+    def on_click(x: float, y: float) -> None:
+        """A real coordinate from a real display server. No calibration."""
+        now = time.time()
+        backend = ui["backend"]
+        bar_showing = now < ui["bar_until"]
+
+        # First touch summons the bar rather than pressing whatever happens to
+        # be under your finger. Otherwise reaching out to see the screen would
+        # fire a button you never meant to press.
+        if not bar_showing:
+            ui["bar_until"] = now + BAR_SECONDS
+            if renderer.is_night(cfg, now, state["night_mode"]):
+                ui["wake_until"] = now + max(cfg.night_wake_seconds, BAR_SECONDS)
+            _redraw()
+            return
+
+        buttons = renderer.button_layout(cfg, state, backend.width, backend.height)
+        key = renderer.hit_test(buttons, x, y)
+        if key == "view":
+            state["view"] = "minimal" if state["view"] == "full" else "full"
+        elif key == "night":
+            order = ["auto", "on", "off"]
+            state["night_mode"] = order[(order.index(state["night_mode"]) + 1) % 3]
+            ui["wake_until"] = 0.0          # an explicit choice ends any wake
+        elif key == "units":
+            state["units"] = "mmol" if state["units"] == "mgdl" else "mgdl"
+            cfg.units = state["units"]
+        elif key == "minimize":
+            if hasattr(backend, "minimize"):
+                backend.minimize()
+                ui["bar_until"] = 0.0
+            else:
+                ui["quit"] = True           # no window manager: exit instead
+            _persist()
+            return
+        else:
+            # A press in the dashboard area while the bar is up just keeps it up.
+            ui["bar_until"] = now + BAR_SECONDS
+            _redraw()
+            return
+
+        ui["bar_until"] = now + BAR_SECONDS
+        _persist()
+        _redraw()
+
+    def _persist() -> None:
+        """Remember the choices, so a restart does not undo them. Best effort:
+        a read-only home must not stop the display working."""
+        cfg.view, cfg.night_mode, cfg.units = state["view"], state["night_mode"], state["units"]
+        try:
+            configmod.save(cfg)
+        except OSError as e:
+            _err(f"could not save settings: {e}")
+
+    def _redraw() -> None:
+        backend = ui["backend"]
+        if backend is None:
+            return
+        now = time.time()
+        try:
+            backend.show(renderer.render(
+                cfg, poller.get(), now=now, view=state["view"], state=state,
+                bar=now < ui["bar_until"],
+                hint=clickable and now >= ui["bar_until"],
+                force_day=now < ui["wake_until"],
+            ))
+        except Exception as e:
+            _err(f"render/display error: {e}")
+
     try:
-        backend = open_backend(cfg)
+        backend = open_backend(cfg, on_click=on_click)
     except BackendError as e:
         _err(str(e))
         return EXIT_HARDWARE
+    ui["backend"] = backend
 
-    # The backend knows the panel's real geometry; trust it over the config so
-    # a wrong width in a hand-edited file cannot letterbox the dashboard.
-    if backend.name == "fb":
+    # The backend knows the real geometry; trust it over the config so a wrong
+    # width in a hand-edited file cannot letterbox the dashboard.
+    if backend.name in ("fb", "window"):
         cfg.width, cfg.height = backend.width, backend.height
 
+    clickable = backend.name == "window"
     _say(f"backend={backend.name} {backend.width}x{backend.height} "
          f"rotate={cfg.rotate} server={cfg.base_url}")
 
     poller = Poller(cfg)
-    stopping = False
-
-    # `wake` doubles as the frame clock and the "something happened, redraw
-    # now" signal. Without it a tap would wait out the sleep below before
-    # anything changed on screen, which reads as an unresponsive screen.
-    wake = threading.Event()
-    view = cfg.view if cfg.view in renderer.VIEWS else "full"
-    wake_until = 0.0
-    hidden = False
-
-    def handle(signum, _frame):
-        nonlocal stopping
-        stopping = True
-        poller.stop()
-        wake.set()
-
-    signal.signal(signal.SIGTERM, handle)
-    signal.signal(signal.SIGINT, handle)
-
-    # ---- touchscreen -------------------------------------------------------
     watcher = None
-    if cfg.touch != "off":
-        from .touch import TouchWatcher                       # noqa: PLC0415
+    last_error: str | None = None
 
-        def on_long_press() -> None:
-            nonlocal stopping, hidden
-            hidden = True
-            stopping = True
-            poller.stop()
-            wake.set()
+    # A touchscreen read from /dev/input is only needed when there is no
+    # display server to deliver clicks. Under `window` the toolkit already
+    # has them, correctly mapped, and opening the raw device as well would
+    # double every press.
+    if not clickable and cfg.touch != "off":
+        from .touch import TouchWatcher                          # noqa: PLC0415
 
-        def on_tap() -> None:
-            nonlocal view, wake_until
-            # During the night window a tap does NOT toggle the view -- it
-            # wakes the screen. Someone walking past at 3am wants to see the
-            # number, not to discover they have silently changed a setting
-            # they will not notice until morning.
-            if renderer.is_night(cfg, time.time()) and cfg.night_wake_seconds > 0:
-                wake_until = time.time() + cfg.night_wake_seconds
-            else:
-                view = "minimal" if view == "full" else "full"
-            wake.set()
-
-        watcher = TouchWatcher(None if cfg.touch == "auto" else cfg.touch,
-                               on_tap, on_long_press)
+        watcher = TouchWatcher(
+            None if cfg.touch == "auto" else cfg.touch,
+            lambda: on_click(-1, -1),                            # summon the bar
+            lambda: on_click(-1, -1),
+        )
         watcher.start()
-        # Give the thread a moment to open the device so the first frame
-        # already knows whether to draw the button.
         time.sleep(0.2)
         if watcher.error:
             _err(f"touch: {watcher.error}")
         else:
-            _say(f"touch={watcher.path} — tap to switch view, hold to hide")
+            _say(f"touch={watcher.path}")
 
-    show_button = bool(watcher and watcher.path and not watcher.error)
-    # Only advertise "hold to hide" when hiding actually works. Under systemd
-    # the unit's RestartPreventExitStatus honours EXIT_HIDDEN; run by hand from
-    # a shell there is no supervisor, so the process simply exits -- still
-    # correct, so the chip is shown either way.
-    can_hide = show_button
+    if clickable:
+        ui["bar_until"] = time.time() + BAR_SECONDS   # show the controls once at startup
+
+    def tick() -> None:
+        nonlocal last_error
+        snap = poller.get()
+        if snap.last_error and snap.last_error != last_error:
+            _err(snap.last_error)            # journald gets one line per change,
+            last_error = snap.last_error     # not one per poll
+        elif snap.ok and last_error:
+            _say("recovered")
+            last_error = None
+        _redraw()
 
     poller.start()
-    last_error: str | None = None
     try:
-        while not stopping:
-            snap = poller.get()
-            if snap.last_error and snap.last_error != last_error:
-                _err(snap.last_error)          # journald gets one line per change,
-                last_error = snap.last_error   # not one per poll
-            elif snap.ok and last_error:
-                _say("recovered")
-                last_error = None
+        if getattr(backend, "owns_event_loop", False):
+            # Tk insists on its mainloop being on the main thread, so it drives
+            # us. One-second ticks: the bar's timeout and the "N min ago"
+            # counter both need finer resolution than the 60s poll.
+            backend.run_loop(tick, interval_ms=1000)
+        else:
+            wake = threading.Event()
 
-            awake = time.time() < wake_until
-            try:
-                backend.show(renderer.render(
-                    cfg, snap, view=view, show_button=show_button,
-                    force_day=awake, can_hide=can_hide,
-                ))
-            except Exception as e:  # a bad frame must not end the process
-                _err(f"render/display error: {e}")
+            def handle(_signum, _frame):
+                ui["quit"] = True
+                poller.stop()
+                wake.set()
 
-            # Redraw on a 10s cadence even though data arrives every 60s: the
-            # clock and the "N min ago" counter both have to stay honest. Cut
-            # that short while a night wake is counting down so the screen
-            # fades back promptly rather than up to 10s late.
-            wake.wait(1 if awake else 10)
-            wake.clear()
+            signal.signal(signal.SIGTERM, handle)
+            signal.signal(signal.SIGINT, handle)
+            while not ui["quit"]:
+                tick()
+                wake.wait(1)
+                wake.clear()
     finally:
         poller.stop()
         if watcher:
             watcher.stop()
-        if hidden:
-            # Blank the panel on the way out. Leaving the last dashboard frame
-            # sitting there would show a number that is no longer being
-            # refreshed -- the exact thing this program refuses to do
-            # everywhere else.
-            try:
-                from PIL import Image as _Image
-                backend.show(_Image.new("RGB", (backend.width, backend.height), (0, 0, 0)))
-            except Exception:
-                pass
         try:
             backend.close()
         except Exception:
             pass
-    if hidden:
-        _say("hidden — bring it back with: sentinelle-display show")
-        return EXIT_HIDDEN
     return 0
 
 
@@ -320,6 +357,24 @@ def cmd_probe(_args) -> int:
         _say(f"  could not enumerate: {e}")
 
     _say()
+    _say("Desktop session")
+    import os as _os
+    disp = _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY")
+    if disp:
+        _say(f"  present ({disp}) — the window backend will be used")
+        _say("  clicks come from the display server, already calibrated")
+    else:
+        _say("  none in this shell.")
+        _say("  Note: probe over SSH has no DISPLAY even when the Pi has a")
+        _say("  desktop. What matters is the session the display runs in.")
+    try:
+        import tkinter                                        # noqa: F401
+        from PIL import ImageTk                               # noqa: F401
+        _say("  tkinter + ImageTk  ok")
+    except ImportError:
+        _say("  tkinter + ImageTk  MISSING (sudo apt install python3-tk python3-pil.imagetk)")
+
+    _say()
     _say("Touchscreen")
     try:
         from .touch import find_touch_device, list_input_devices
@@ -362,6 +417,7 @@ def cmd_probe(_args) -> int:
     _say(f"  geometry     {cfg.width}x{cfg.height} rotate {cfg.rotate}")
     _say(f"  touch        {cfg.touch}")
     _say(f"  view         {cfg.view}")
+    _say(f"  night        {cfg.night} (mode: {cfg.night_mode})")
 
     if cfg.token:
         _say()

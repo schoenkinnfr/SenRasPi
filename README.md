@@ -209,69 +209,63 @@ It is already enabled, so it comes back on every boot.
 
 ---
 
-## 6. The two views
+## 6. The controls
 
-Tap the screen to switch between them; **hold a finger down for 1.5 seconds to
-hide it** and hand the panel back to the desktop. Two small chips in the
-bottom-right corner name both gestures — `tap · less` and `hold · hide` — so
-neither has to be guessed.
+Touch anywhere to bring up the control bar. It hides itself after about eight
+seconds; the small `•••` chip in the corner is the standing reminder that it
+exists.
 
-**Full** — glucose with trend arrow, 3-hour graph with the target band shaded,
-insulin on board, pump reservoir, battery, sensor age, 24-hour time in range.
-For standing in front of the screen.
+| Button | Does |
+|---|---|
+| **VIEW** | Full dashboard ⇄ Minimal — the number at twice the size, for reading across a room |
+| **NIGHT** | Auto / On / Off — see below |
+| **UNITS** | mg/dL ⇄ mmol/L |
+| **Minimize** | Minimises the window to the taskbar. Click it there to bring it back. |
 
-**Minimal** — the number at roughly twice the size, the trend arrow, the state
-in words, and how old the reading is. For reading from the other side of the
-room, where a 40px IOB figure is unreadable anyway.
+The first touch only summons the bar; it never presses whatever happened to be
+under your finger. Reaching out to look at the screen should not change a
+setting.
 
-**A tap or hold anywhere on the glass counts**, not just on the chips. Mapping taps to a
-hit-region needs the panel's raw ADC range, which varies by board and drifts
-with temperature, so a real button either needs a calibration step or quietly
-stops working near the edges. With one control on the screen, "anywhere" is
-more robust and much easier to hit in the dark.
+**NIGHT is three-way, not a toggle.** `Auto` follows the configured schedule
+(`22-7` by default). `On` and `Off` force the ambient wash either way. A plain
+on/off switch would replace the schedule with something you have to remember to
+flip twice a day, and the failure mode is a bedroom screen at full brightness
+all night because you forgot.
 
-**At night a tap wakes the screen instead of switching views.** Walking past at
-3am and touching the glass shows the real dashboard for 30 seconds, then it
-fades back to the ambient wash. It does not silently change a setting you would
-only discover in the morning.
+The bar stays visible during the night wash. Otherwise setting `NIGHT: On`
+would hide the only control that can set it back — a one-way door escapable
+only over SSH.
 
-### Hiding and bringing it back
+Changes are written to the config file, so they survive a restart.
 
-A long press exits with status 64, and the systemd unit lists that under
-`RestartPreventExitStatus`, so it stays gone rather than restarting five
-seconds later. The panel is blanked on the way out — leaving the last frame up
-would show a number that is no longer being refreshed.
+### Why a window and not the framebuffer
 
-To bring it back:
+On **Raspberry Pi OS Desktop** the display runs as a real fullscreen window and
+the desktop compositor owns the screen. That matters for a specific reason: the
+`fb` backend writes straight into `/dev/fb0`, and on a Desktop image the
+desktop owns that framebuffer too. The two fight. The symptom is exact and
+baffling — the dashboard looks right until you touch it, then the pointer event
+makes the desktop repaint the damaged region and the dashboard is visibly eaten
+away, partly returning on the next redraw. Nothing is broken; two programs are
+drawing the same pixels.
 
-- **The menu entry** — *Sentinelle Glucose Display*, under Accessories. There
-  is a matching shortcut on the desktop.
-- **`sentinelle-display show`** from any shell.
-- Or the long way, `sudo systemctl start sentinelle-display`.
+A window also means real click coordinates, so the buttons above are actual hit
+regions rather than whole-screen gestures — the display server has already done
+the touchscreen calibration. And Minimize can genuinely minimise rather than
+killing the process.
 
-`install.sh` writes a sudoers rule permitting exactly `start`, `stop` and
-`restart` of this one unit without a password, so a single click on the
-launcher works. It is validated with `visudo` before being installed — a
-malformed sudoers file locks you out of `sudo` entirely. If validation fails
-the rule is skipped and `show` falls back to prompting.
+It costs about 40MB over the framebuffer path. On a board already running a
+desktop that is noise. On **Lite** there is no desktop to fight with, so use
+`--set backend=fb`, keep the 35MB footprint, and the controls fall back to
+whole-screen gestures (tap to change view, hold to exit) read from
+`/dev/input`.
 
-`sentinelle-display hide` and `sentinelle-display status` do what they say.
+On a Desktop image the display is started from the **desktop session's
+autostart**, not from systemd — a systemd unit has no `DISPLAY` or
+`WAYLAND_DISPLAY`, so a window backend launched that way cannot open a window
+at all. `install.sh` detects which case you are in and wires up the right one.
 
-On Raspberry Pi OS Lite there is no menu, so no `.desktop` file is written;
-`sentinelle-display show` is the way back.
-
-```bash
-sentinelle-display config --set view=minimal              # which view to start in
-sentinelle-display config --set night_wake_seconds=60
-sentinelle-display config --set touch=off                 # ignore the touchscreen
-sentinelle-display config --set touch=/dev/input/event3    # if auto-detect picks wrong
-```
-
-`sentinelle-display probe` lists every input device and marks the one it would
-use. If nothing is marked, set `touch` to the right `/dev/input/eventN` by hand.
-
-Reading the touchscreen needs membership of the `input` group. `install.sh`
-adds you, and it takes effect on the next **reboot**, not the next shell.
+`sentinelle-display probe` reports which path applies.
 
 ---
 
@@ -294,7 +288,8 @@ sudo systemctl restart sentinelle-display       # settings apply on restart
 | `poll_seconds` | `60` | How often to ask the server |
 | `palette` | `clinical` | `clinical` (red/green/amber) or `cvd` — see below |
 | `rotate` | `0` | `0`/`90`/`180`/`270`. See the note below. |
-| `backend` | `auto` | `auto`, `fb`, `spi`, `png` |
+| `backend` | `auto` | `auto`, `window`, `fb`, `spi`, `png` |
+| `night_mode` | `auto` | `auto` follows the schedule; `on`/`off` force the wash |
 | `touch` | `auto` | `auto`, `off`, or a literal `/dev/input/eventN` |
 | `view` | `full` | Which view to start in: `full` or `minimal` |
 | `night_wake_seconds` | `30` | How long a night-time tap shows the real screen. `0` disables |
@@ -336,6 +331,8 @@ Run `sentinelle-display probe` first. It answers most of these.
 | `access revoked or wrong scope` | The token was revoked in Settings, or the code was `ambient`-scoped. Generate a `Full dashboard` code and re-pair. |
 | It hides itself and comes straight back | `RestartPreventExitStatus=64` is missing from the unit. Re-run `./install.sh`. |
 | The menu entry does nothing when clicked | The sudoers rule did not install, so `sudo` is silently prompting where nothing can answer. Run `sentinelle-display show` in a terminal to see the real error. |
+| The dashboard gets eaten away when you touch it | You are on the `fb` backend with a desktop running; both write to `/dev/fb0`. Use `--set backend=window`, or boot to console. |
+| `cannot open a window` | No `DISPLAY`/`WAYLAND_DISPLAY`. On a desktop it is started from the session's autostart, not systemd, precisely because units have neither. |
 | Tapping does nothing | `probe` says whether a touchscreen was found. If it was, you are probably not in the `input` group yet — that needs a **reboot**, not a new shell. |
 | No **more**/**less** chip | No touchscreen detected, so the button is deliberately not drawn. Advertising a control that does not exist is worse than omitting it. |
 | A plain colour wash with one small number | That is night mode, working. Check `timedatectl` — a Pi still on UTC thinks it is 4-5 hours later than you do. `config --set night=off` disables it. |
