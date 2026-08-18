@@ -23,6 +23,8 @@ import threading
 import time
 from typing import Any
 
+from pathlib import Path
+
 from . import config as configmod
 from .client import PairError, Poller, format_code, normalise_code, redeem_code
 
@@ -527,57 +529,168 @@ def cmd_config(args) -> int:
 SERVICE = "sentinelle-display"
 
 
-def _systemctl(action: str) -> int:
+# There are two ways this program gets started, and `show`/`hide`/`status`
+# have to be right in both:
+#
+#   systemd     headless panels (Lite, framebuffer or direct SPI). A system
+#               unit starts it at boot.
+#   session     Raspberry Pi OS Desktop. A ~/.config/autostart entry starts it
+#               with the desktop, because a systemd unit has no DISPLAY and
+#               the window backend could not open a window from one.
+#
+# Reporting only the systemd unit would mean `status` saying "inactive" while
+# the dashboard is visibly on the screen in front of you.
+
+
+def is_run_argv(argv: list[str]) -> bool:
+    """Does this argv belong to a `sentinelle-display run`?
+
+    Split out so it can be tested without spawning processes. The rule: find
+    the token naming this program, then require "run" somewhere after it.
+    NOT `argv[-1] == "run"` -- flags follow the subcommand.
+    """
+    argv = [a for a in argv if a]
+    prog = next((i for i, a in enumerate(argv)
+                 if a.endswith("sentinelle-display") or a == "sentinelle_display.cli"),
+                None)
+    return prog is not None and "run" in argv[prog + 1:]
+
+
+def _running_pids() -> list[int]:
+    """PIDs of any live `sentinelle-display run`.
+
+    Reads /proc directly and matches argv TOKENS. `pgrep -f
+    "sentinelle-display run"` looks like the obvious way to do this and is
+    wrong: it substring-matches the whole command line, so it happily reports
+    the shell that is running the check, and `status` claims the display is up
+    when it is not.
+    """
+    me, parent = os.getpid(), os.getppid()
+    found: list[int] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return found
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in (me, parent):
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            continue                       # the process exited mid-scan
+        if is_run_argv(argv):
+            found.append(pid)
+    return sorted(found)
+
+
+def _unit_state() -> tuple[str, str]:
+    """(is-active, is-enabled) for the systemd unit, or ("", "") if absent."""
     import shutil
     import subprocess
-
     if not shutil.which("systemctl"):
-        _err("systemctl not found — this machine does not use systemd.")
-        _err("Start the display directly instead:  sentinelle-display run")
-        return EXIT_CONFIG
+        return "", ""
+    def q(verb: str) -> str:
+        try:
+            return subprocess.run(["systemctl", verb, SERVICE],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    active, enabled = q("is-active"), q("is-enabled")
+    # "not-found" means no such unit; report that as "no systemd unit here"
+    # rather than as a unit in a strange state.
+    if enabled in ("", "not-found"):
+        return "", ""
+    return active, enabled
 
+
+def _systemctl(action: str) -> int:
+    import subprocess
     cmd = ["systemctl", action, SERVICE]
     if os.geteuid() != 0:
         # install.sh drops a sudoers rule permitting exactly start/stop/restart
-        # of this one unit without a password, so the desktop launcher works
-        # with a single click. If that rule is absent sudo prompts, which on a
-        # launcher click means nothing visibly happens -- hence the hint.
+        # of this one unit without a password.
         cmd = ["sudo", "-n", *cmd]
-
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
         _err(f"could not {action} {SERVICE}: {detail or 'unknown error'}")
-        if "password" in detail.lower() or "sudo" in detail.lower():
-            _err("Re-run ./install.sh to install the sudoers rule, or use:")
-            _err(f"  sudo systemctl {action} {SERVICE}")
         return 1
     return 0
 
 
 def cmd_show(_args) -> int:
-    """Bring the display back after a long-press hide."""
-    rc = _systemctl("start")
-    if rc == 0:
-        _say("display started")
-    return rc
+    """Start the display, whichever way this machine starts it."""
+    if _running_pids():
+        _say("already running")
+        return 0
+
+    active, enabled = _unit_state()
+    if enabled in ("enabled", "static"):
+        rc = _systemctl("start")
+        if rc == 0:
+            _say("display started (systemd)")
+        return rc
+
+    # Desktop: launch it detached from this shell, so closing the terminal or
+    # the SSH session does not take the dashboard down with it.
+    import subprocess
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        _err("No DISPLAY in this shell — over SSH there is none even when the")
+        _err("Pi has a desktop. Start it from the Pi's own screen, from the")
+        _err("Accessories menu, or just log out and back in: it is in the")
+        _err("desktop's autostart.")
+        return 1
+    subprocess.Popen([sys.executable, "-m", "sentinelle_display.cli", "run"],
+                     start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _say("display started")
+    return 0
 
 
 def cmd_hide(_args) -> int:
-    """Same as holding a finger on the screen."""
-    rc = _systemctl("stop")
-    if rc == 0:
-        _say("display hidden — bring it back with: sentinelle-display show")
-    return rc
+    pids = _running_pids()
+    _, enabled = _unit_state()
+    if enabled in ("enabled", "static"):
+        rc = _systemctl("stop")
+        if rc == 0:
+            _say("display stopped")
+        return rc
+    if not pids:
+        _say("not running")
+        return 0
+    import signal as _signal
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except OSError as e:
+            _err(f"could not stop pid {pid}: {e}")
+            return 1
+    _say(f"display stopped ({len(pids)} process{'es' if len(pids) > 1 else ''})")
+    return 0
 
 
 def cmd_status(_args) -> int:
-    import subprocess
-    proc = subprocess.run(["systemctl", "is-active", SERVICE],
-                          capture_output=True, text=True)
-    state = proc.stdout.strip() or "unknown"
-    _say(f"{SERVICE}: {state}")
-    return 0 if state == "active" else 1
+    pids = _running_pids()
+    active, enabled = _unit_state()
+
+    if pids:
+        _say(f"running (pid {', '.join(str(p) for p in pids)})")
+    else:
+        _say("not running")
+
+    if enabled:
+        _say(f"systemd unit: {active or 'unknown'}, {enabled}")
+        if enabled == "disabled" and pids:
+            _say("  (started by the desktop session, which is correct on a "
+                 "Desktop image)")
+    else:
+        _say("systemd unit: not installed")
+
+    autostart = Path.home() / ".config" / "autostart" / "sentinelle-display.desktop"
+    _say(f"desktop autostart: {'present' if autostart.exists() else 'not installed'}")
+    return 0 if pids else 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

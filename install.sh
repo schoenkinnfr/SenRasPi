@@ -253,7 +253,7 @@ Version=1.0
 Name=Sentinelle Glucose Display
 GenericName=Glucose Display
 Comment=Show the always-on glucose panel (hold a finger on the screen to hide it)
-Exec=sentinelle-display run
+Exec=sentinelle-display-session
 Icon=utilities-system-monitor
 Terminal=false
 Categories=Utility;Monitor;
@@ -272,17 +272,37 @@ DESK
   fi
   # Start it with the desktop session. This is what replaces the systemd unit
   # on a Desktop image.
+  # A launcher script rather than a shell one-liner inside Exec=. The Desktop
+  # Entry spec has its own quoting rules for Exec, and a redirect with quotes
+  # in it is exactly the kind of thing that parses on one desktop and silently
+  # fails to start on another.
+  sudo tee /usr/local/bin/sentinelle-display-session >/dev/null <<'LAUNCH'
+#!/bin/sh
+# Started by the desktop session's autostart. It logs, because an autostarted
+# app has no console: without this a failure to start is completely invisible,
+# and the only symptom is a screen that stays on the wallpaper.
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/sentinelle-display.log"
+# Keep one previous run and start fresh, so the log cannot grow without bound.
+# This lives on an SD card, and writes are what kill SD cards.
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+exec sentinelle-display run >>"$LOG" 2>&1
+LAUNCH
+  sudo chmod 0755 /usr/local/bin/sentinelle-display-session
+
   AUTOSTART_DIR="$(getent passwd "$RUN_USER" | cut -d: -f6)/.config/autostart"
   sudo -u "$RUN_USER" mkdir -p "$AUTOSTART_DIR"
   sudo -u "$RUN_USER" tee "$AUTOSTART_DIR/sentinelle-display.desktop" >/dev/null <<'AUTO'
 [Desktop Entry]
 Type=Application
 Name=Sentinelle Glucose Display
-Exec=sentinelle-display run
+Exec=sentinelle-display-session
 Terminal=false
 X-GNOME-Autostart-enabled=true
 AUTO
   note "autostart: $AUTOSTART_DIR"
+  note "session log: ~/.local/state/sentinelle-display.log"
 
   command -v update-desktop-database >/dev/null && \
     sudo update-desktop-database /usr/share/applications 2>/dev/null || true

@@ -556,3 +556,26 @@ def test_the_hidden_exit_code_matches_the_systemd_unit():
         if f.exists():
             assert f"RestartPreventExitStatus={cli.EXIT_HIDDEN}" in f.read_text(), \
                 f"{f.name} does not prevent restart on exit {cli.EXIT_HIDDEN}"
+
+
+# ── process detection ───────────────────────────────────────────────────────
+
+
+def test_run_argv_matching_is_exact_not_substring():
+    """`pgrep -f "sentinelle-display run"` substring-matches the whole command
+    line, so it reports the shell running the check and `status` claims the
+    display is up when it is not. This is the replacement; it must not."""
+    from sentinelle_display.cli import is_run_argv
+
+    # real invocations
+    assert is_run_argv(["/opt/sentinelle-display/bin/sentinelle-display", "run"])
+    assert is_run_argv(["python3", "-m", "sentinelle_display.cli", "run"])
+    assert is_run_argv(["sentinelle-display", "run", "--backend", "png"])
+
+    # not the display
+    assert not is_run_argv(["sentinelle-display", "status"])
+    assert not is_run_argv(["sentinelle-display", "pair"])
+    assert not is_run_argv(["/bin/bash", "-c", "echo sentinelle-display run"])
+    assert not is_run_argv(["vim", "sentinelle-display"])
+    assert not is_run_argv(["run"])
+    assert not is_run_argv([])

@@ -265,7 +265,14 @@ autostart**, not from systemd — a systemd unit has no `DISPLAY` or
 `WAYLAND_DISPLAY`, so a window backend launched that way cannot open a window
 at all. `install.sh` detects which case you are in and wires up the right one.
 
-`sentinelle-display probe` reports which path applies.
+`sentinelle-display probe` reports which path applies, and
+`sentinelle-display status` reports whether it is running and which mechanism
+started it.
+
+Because an autostarted app has no console, the session launcher writes to
+`~/.local/state/sentinelle-display.log` (one previous run kept as `.log.1`).
+That is the first place to look if the screen stays on the wallpaper after
+logging in.
 
 ---
 
@@ -332,6 +339,7 @@ Run `sentinelle-display probe` first. It answers most of these.
 | It hides itself and comes straight back | `RestartPreventExitStatus=64` is missing from the unit. Re-run `./install.sh`. |
 | The menu entry does nothing when clicked | The sudoers rule did not install, so `sudo` is silently prompting where nothing can answer. Run `sentinelle-display show` in a terminal to see the real error. |
 | The dashboard gets eaten away when you touch it | You are on the `fb` backend with a desktop running; both write to `/dev/fb0`. Use `--set backend=window`, or boot to console. |
+| Nothing starts after login | `cat ~/.local/state/sentinelle-display.log`. If the file does not exist, the autostart entry is missing — re-run `./install.sh`. |
 | `cannot open a window` | No `DISPLAY`/`WAYLAND_DISPLAY`. On a desktop it is started from the session's autostart, not systemd, precisely because units have neither. |
 | Tapping does nothing | `probe` says whether a touchscreen was found. If it was, you are probably not in the `input` group yet — that needs a **reboot**, not a new shell. |
 | No **more**/**less** chip | No touchscreen detected, so the button is deliberately not drawn. Advertising a control that does not exist is worse than omitting it. |
