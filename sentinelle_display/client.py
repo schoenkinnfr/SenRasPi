@@ -207,3 +207,163 @@ class Poller(threading.Thread):
             backoff = min(snap.consecutive_failures, 4) * 15 if snap.consecutive_failures else 0
             self._wake.wait(self.cfg.poll_seconds + backoff)
             self._wake.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The daily review behind the OTHER page.
+#
+# All of the work happens on the server: four agents read the last 24 hours and
+# leave two or three sentences and a joke in a table. The Pi's whole job is to
+# fetch that text every quarter of an hour and, when someone presses REFRESH,
+# to ask for a new one and then watch for it to land.
+#
+# Failure here must be completely inert. The glucose display is the reason this
+# device exists; a review that will not load is a card that says so, never a
+# missing number.
+
+
+@dataclass
+class Review:
+    """The newest review the server has, or why we do not have one."""
+
+    ok: bool = False
+    data: dict[str, Any] | None = None
+    fetched_at: float = 0.0
+    last_error: str | None = None
+    #: A refresh has been asked for and the server has not finished yet.
+    generating: bool = False
+
+    @property
+    def recommendation(self) -> str | None:
+        return (self.data or {}).get("recommendation")
+
+    @property
+    def joke(self) -> str | None:
+        return (self.data or {}).get("joke")
+
+    @property
+    def is_today(self) -> bool:
+        return bool((self.data or {}).get("is_today"))
+
+
+class ReviewPoller(threading.Thread):
+    """Fetches /kiosk/review slowly, and POSTs /kiosk/review/refresh on demand.
+
+    Two intervals rather than one: the review changes once a day, so asking
+    every fifteen minutes is already generous — but once a refresh has been
+    requested the answer is a minute or two away, and waiting a quarter of an
+    hour to notice it would make the button feel broken.
+    """
+
+    daemon = True
+
+    #: How often to re-ask while the server is generating.
+    BUSY_SECONDS = 20
+    #: Give up on "still generating" after this long and go back to the slow
+    #: interval, so a server-side failure cannot leave the panel spinning.
+    BUSY_TIMEOUT = 6 * 60
+
+    def __init__(self, cfg):
+        super().__init__(name="sentinelle-review")
+        self.cfg = cfg
+        self.review = Review()
+        self._stopping = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._refresh_requested = False
+        self._busy_since = 0.0
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self._wake.set()
+
+    def get(self) -> Review:
+        with self._lock:
+            return self.review
+
+    def refresh_now(self) -> None:
+        """Ask the server to regenerate. Returns immediately; the answer
+        arrives on a later poll."""
+        with self._lock:
+            self._refresh_requested = True
+            self.review = Review(
+                ok=self.review.ok, data=self.review.data,
+                fetched_at=self.review.fetched_at, last_error=None, generating=True,
+            )
+        self._busy_since = time.time()
+        self._wake.set()
+
+    # ------------------------------------------------------------------
+    def _post_refresh(self) -> None:
+        body = json.dumps({"k": self.cfg.token}).encode()
+        req = urllib.request.Request(
+            self.cfg.review_refresh_url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode()).get("error", "")
+            except Exception:
+                pass
+            # 429 is the server's rate limit, and it is a normal answer to a
+            # button on a wall: say so on the panel rather than treating it as
+            # a fault.
+            self._fail("too soon — try again shortly" if e.code == 429
+                       else f"refresh refused ({e.code}{': ' + detail if detail else ''})")
+            self._busy_since = 0.0
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            self._fail(f"cannot reach the server — {getattr(e, 'reason', e)}")
+            self._busy_since = 0.0
+
+    def _fetch_once(self) -> None:
+        url = f"{self.cfg.review_url}?{urllib.parse.urlencode({'k': self.cfg.token})}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            self._fail({
+                401: "access revoked or wrong scope — re-pair this display",
+                404: "this server has no review endpoint yet",
+            }.get(e.code, f"server error {e.code}"))
+            return
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+            self._fail(f"offline — {getattr(e, 'reason', e)}")
+            return
+
+        generating = bool(payload.get("generating"))
+        if not generating and self._busy_since:
+            self._busy_since = 0.0
+        with self._lock:
+            self.review = Review(
+                ok=bool(payload.get("ok")), data=payload,
+                fetched_at=time.time(), last_error=None, generating=generating,
+            )
+
+    def _fail(self, msg: str) -> None:
+        with self._lock:
+            prev = self.review
+            self.review = Review(
+                ok=prev.ok, data=prev.data, fetched_at=prev.fetched_at,
+                last_error=msg, generating=False,
+            )
+
+    def run(self) -> None:
+        while not self._stopping.is_set():
+            if self._refresh_requested:
+                with self._lock:
+                    self._refresh_requested = False
+                self._post_refresh()
+            self._fetch_once()
+
+            busy = self._busy_since and (time.time() - self._busy_since) < self.BUSY_TIMEOUT
+            if self._busy_since and not busy:
+                self._busy_since = 0.0          # stopped waiting; it is not coming
+            delay = self.BUSY_SECONDS if busy else max(self.cfg.review_minutes, 5) * 60
+            self._wake.wait(delay)
+            self._wake.clear()

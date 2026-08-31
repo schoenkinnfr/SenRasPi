@@ -81,6 +81,19 @@ class Config:
     # fading back to the ambient wash. 0 disables the wake.
     night_wake_seconds: int = 30
 
+    # --- the "Other" page ------------------------------------------------
+    # A second page, reached with the OTHER button, showing the server's
+    # once-a-day review of the last 24 hours and that day's joke. The thinking
+    # all happens on the server (four agents, see server/src/coach); the Pi
+    # only fetches the finished text, which is why this costs the panel
+    # nothing but one small HTTP request every quarter of an hour.
+    review: str = "on"                   # "on" | "off"
+    review_minutes: int = 15             # how often to refetch the stored review
+    # Seconds of no interaction before the Other page hands the screen back to
+    # the glucose dashboard. 0 keeps it up until you press Back -- reasonable
+    # on a desk, wrong on a wall panel whose whole job is the number.
+    other_seconds: int = 180
+
     # --- allergen panel --------------------------------------------------
     # Pollen from Open-Meteo's Air Quality API (Copernicus CAMS, ~11km,
     # grains/m3, no key). EUROPE ONLY -- CAMS has no pollen over North
@@ -101,6 +114,14 @@ class Config:
     @property
     def kiosk_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/kiosk/data"
+
+    @property
+    def review_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/kiosk/review"
+
+    @property
+    def review_refresh_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/kiosk/review/refresh"
 
     @property
     def night_window(self) -> tuple[int, int] | None:
@@ -126,6 +147,13 @@ class Config:
             problems.append(f"units must be mgdl or mmol (got {self.units!r})")
         if not 1 <= self.hours <= 12:
             problems.append(f"hours must be between 1 and 12 (got {self.hours})")
+        if self.review not in ("on", "off"):
+            problems.append(f"review must be on or off (got {self.review!r})")
+        if self.review_minutes < 5:
+            problems.append("review_minutes below 5 re-asks for a document that changes "
+                            "once a day")
+        if self.other_seconds < 0:
+            problems.append(f"other_seconds cannot be negative (got {self.other_seconds})")
         if self.pollen not in ("on", "off"):
             problems.append(f"pollen must be on or off (got {self.pollen!r})")
         if not -90 <= self.pollen_lat <= 90 or not -180 <= self.pollen_lon <= 180:

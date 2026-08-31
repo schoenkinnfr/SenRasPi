@@ -84,8 +84,25 @@ if [[ ! -x "$VENV/bin/python" ]]; then
   sudo python3 -m venv --system-site-packages "$VENV"
 fi
 sudo "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
-sudo "$VENV/bin/pip" install --quiet --no-deps --upgrade "$REPO_DIR"
-note "$("$VENV/bin/python" -c 'import sentinelle_display as s; print("sentinelle-display", s.__version__)')"
+# --force-reinstall is not paranoia. The version in pyproject.toml does not
+# change between routine updates, and `pip install --upgrade <local dir>` can
+# then decide the requirement is already satisfied and copy nothing. The
+# installer reports success, the venv keeps the OLD code, and the only symptom
+# is "I ran install.sh but it is still the old program". --no-deps keeps this
+# to our package alone, so it stays a couple of seconds.
+sudo "$VENV/bin/pip" install --quiet --no-deps --upgrade --force-reinstall "$REPO_DIR"
+
+# Print the mtime of an installed file, not just the version string: the
+# version is a constant and would look identical whether or not the copy
+# happened. A timestamp from moments ago is proof it did.
+note "$("$VENV/bin/python" - <<'PYVER'
+import datetime, pathlib
+import sentinelle_display as s
+f = pathlib.Path(s.__file__).parent / "cli.py"
+when = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+print(f"sentinelle-display {s.__version__} — files installed {when}")
+PYVER
+)"
 
 sudo ln -sf "$VENV/bin/sentinelle-display" /usr/local/bin/sentinelle-display
 note "sentinelle-display is on your PATH"

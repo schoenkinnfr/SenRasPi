@@ -316,7 +316,7 @@ def test_buttons_tile_the_full_width_without_gaps_or_overlap():
     """A dead strip between two buttons is a press that does nothing, which on
     a touchscreen is indistinguishable from a broken panel."""
     bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
-    assert [b.key for b in bs] == ["view", "night", "units", "minimize"]
+    assert [b.key for b in bs] == ["view", "night", "units", "other", "minimize"]
     assert bs[0].x0 == 0
     assert bs[-1].x1 == 479
     for left, right in zip(bs, bs[1:]):
@@ -437,7 +437,7 @@ def test_buttons_tile_the_full_width_without_gaps_or_overlap():
     """A dead strip between two buttons is a press that does nothing, which on
     a touchscreen is indistinguishable from a broken panel."""
     bs = R.button_layout(cfg(), BAR_STATE, 480, 320)
-    assert [b.key for b in bs] == ["view", "night", "units", "minimize"]
+    assert [b.key for b in bs] == ["view", "night", "units", "other", "minimize"]
     assert bs[0].x0 == 0
     assert bs[-1].x1 == 479
     for left, right in zip(bs, bs[1:]):
@@ -579,3 +579,154 @@ def test_run_argv_matching_is_exact_not_substring():
     assert not is_run_argv(["vim", "sentinelle-display"])
     assert not is_run_argv(["run"])
     assert not is_run_argv([])
+
+
+# ── the OTHER page: daily review + joke ─────────────────────────────────────
+
+
+OTHER_STATE = {"view": "full", "page": "other", "night_mode": "auto", "units": "mgdl"}
+
+
+def test_the_other_page_swaps_view_for_refresh_and_keeps_a_way_back():
+    """The page has exactly one control it needs (Refresh) and exactly one way
+    out (Back). Losing either one strands a device with no keyboard."""
+    bs = R.button_layout(cfg(), OTHER_STATE, 480, 320)
+    keys = [b.key for b in bs]
+    assert keys == ["refresh", "night", "units", "other", "minimize"]
+    assert next(b.value for b in bs if b.key == "other") == "Back"
+    # ...and on the dashboard the same slot offers the way in.
+    back = R.button_layout(cfg(), BAR_STATE, 480, 320)
+    assert next(b.value for b in back if b.key == "other") == "Other"
+
+
+def test_the_bar_still_tiles_with_five_buttons():
+    for w, h in ((480, 320), (320, 240), (800, 480)):
+        bs = R.button_layout(cfg(), OTHER_STATE, w, h)
+        assert bs[0].x0 == 0 and bs[-1].x1 == w - 1
+        for left, right in zip(bs, bs[1:]):
+            assert right.x0 == left.x1 + 1, f"gap/overlap at {left.key}/{right.key}"
+        for x in range(0, w):
+            assert R.hit_test(bs, x, h - 2) is not None, f"x={x} hits nothing"
+
+
+def test_the_other_page_draws_both_halves():
+    """Recommendation on top, joke underneath. If either half is blank the
+    page has silently lost half its content."""
+    when = _daytime()
+    img = R.render(cfg(night="off"), R.demo_snapshot(now=when), now=when,
+                   state=OTHER_STATE, page="other", review=R.demo_review(), bar=True)
+    a = np.asarray(img.convert("L"), dtype=int)
+    top, bottom = a[30:150, :], a[180:270, :]
+    assert top.max() > 90, "no recommendation text drawn"
+    assert bottom.max() > 70, "no joke drawn"
+
+
+def test_the_other_page_is_not_the_dashboard():
+    when = _daytime()
+    snap = R.demo_snapshot(now=when)
+    dash = R.render(cfg(night="off"), snap, now=when, state=BAR_STATE, bar=True)
+    other = R.render(cfg(night="off"), snap, now=when, state=OTHER_STATE,
+                     page="other", review=R.demo_review(), bar=True)
+    assert np.asarray(dash).tobytes() != np.asarray(other).tobytes()
+
+
+def test_the_other_page_overrides_the_night_wash():
+    """You only reach this page by pressing a button, so you are standing at
+    the panel. Answering an explicit request with a colour field would read as
+    a broken button."""
+    night = _at_hour(3)
+    img = R.render(cfg(night="22-7"), R.demo_snapshot(now=night), now=night,
+                   state=OTHER_STATE, page="other", review=R.demo_review())
+    assert np.asarray(img.convert("L")).max() > 90
+
+
+def test_a_review_from_an_earlier_day_is_dimmed_and_dated():
+    """Yesterday's advice shown as if it were tonight's is the one genuinely
+    harmful thing this page could do."""
+    when = _daytime()
+    fresh = R.demo_review()
+    stale = R.demo_review()
+    stale.data = {**stale.data, "is_today": False, "day": "2026-08-30"}
+    a = np.asarray(R.render(cfg(night="off"), R.demo_snapshot(now=when), now=when,
+                            state=OTHER_STATE, page="other", review=fresh).convert("L"),
+                   dtype=int)
+    b = np.asarray(R.render(cfg(night="off"), R.demo_snapshot(now=when), now=when,
+                            state=OTHER_STATE, page="other", review=stale).convert("L"),
+                   dtype=int)
+    assert a.tobytes() != b.tobytes()
+    # The recommendation half is drawn in a muted ink when it is not today's.
+    assert b[30:150, :].max() < a[30:150, :].max()
+
+
+@pytest.mark.parametrize("kind", ["ok", "waiting", "error"])
+def test_every_review_state_renders_without_raising(kind):
+    when = _daytime()
+    img = R.render(cfg(night="off"), R.demo_snapshot(now=when), now=when,
+                   state=OTHER_STATE, page="other", review=R.demo_review(kind), bar=True)
+    assert img.size == (480, 320)
+    assert np.asarray(img.convert("L")).max() > 60
+
+
+def test_the_page_says_so_when_the_review_is_switched_off():
+    kind, msg = R._review_state(cfg(review="off"), R.demo_review())
+    assert kind == "off" and "switched off" in msg
+    # ...and a missing poller is the same case, not a crash.
+    assert R._review_state(cfg(), None)[0] == "off"
+
+
+def test_a_missing_review_still_renders_the_page():
+    when = _daytime()
+    img = R.render(cfg(night="off"), R.demo_snapshot(now=when), now=when,
+                   state=OTHER_STATE, page="other", review=None, bar=True)
+    assert img.size == (480, 320)
+
+
+def test_long_text_shrinks_to_fit_rather_than_falling_off_the_glass():
+    """Agent 4 is told to write two or three sentences; the layout must not
+    depend on it obeying."""
+    from PIL import Image, ImageDraw
+
+    lay = R.Layout(480, 276)
+    draw = ImageDraw.Draw(Image.new("RGB", (480, 276)))
+    long_text = ("Your overnight glucose sat above target from midnight until nearly six, "
+                 "which lines up with the late dinner and the evening walk you skipped. "
+                 "Tomorrow is a Saturday and your Saturdays are usually far more active. "
+                 "Keep fast-acting carbohydrate with you and check in mid-morning.") * 12
+    box_h = 140
+    _f, lines, line_h = R._fit_text(draw, long_text, "regular", (19, 17, 15, 13, 11),
+                                    lay.w - 32, box_h, lay)
+    assert len(lines) * line_h <= box_h
+    assert lines[-1].endswith("…"), "over-long text must show that it was cut"
+
+
+def test_wrapping_never_splits_a_word():
+    from PIL import Image, ImageDraw
+
+    draw = ImageDraw.Draw(Image.new("RGB", (480, 276)))
+    f = R.font("regular", 15)
+    text = "Dinner ran you up to 14.2 for nearly three hours last night."
+    lines = R._wrap(draw, text, f, 160)
+    assert " ".join(lines).split() == text.split()
+
+
+def test_the_other_page_works_before_the_first_reading_arrives():
+    """A freshly paired Pi has no glucose yet. The review page does not depend
+    on one, and should not be replaced by the waiting screen."""
+    when = _daytime()
+    empty = Snapshot(ok=False, data=None, last_error="waiting for the first reading")
+    img = R.render(cfg(night="off"), empty, now=when, state=OTHER_STATE,
+                   page="other", review=R.demo_review(), bar=True)
+    a = np.asarray(img.convert("L"), dtype=int)
+    assert a[30:150, :].max() > 90, "the recommendation is not on screen"
+
+
+def test_the_glucose_offline_banner_does_not_land_on_the_review_header():
+    when = _daytime()
+    snap = R.demo_snapshot(now=when)
+    snap.consecutive_failures = 3
+    assert snap.offline
+    img = R.render(cfg(night="off"), snap, now=when, state=OTHER_STATE,
+                   page="other", review=R.demo_review(), bar=True)
+    strip = np.asarray(img.convert("RGB"), dtype=int)[:20, :]
+    # The banner is a saturated amber bar; the review header is not.
+    assert (strip.max(axis=2) - strip.min(axis=2)).max() < 60

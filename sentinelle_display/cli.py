@@ -144,11 +144,15 @@ def cmd_run(args) -> int:
     # changes what is on screen NOW; `config --set` is what changes the file.
     state = {
         "view": cfg.view if cfg.view in renderer.VIEWS else "full",
+        # Always start on the glucose dashboard. The review page is somewhere
+        # you go on purpose; a display that reboots at 3am and comes back
+        # showing yesterday's advice instead of the number would be a bug.
+        "page": "dashboard",
         "night_mode": cfg.night_mode,
         "units": cfg.units,
     }
     ui = {"bar_until": 0.0, "wake_until": 0.0, "quit": False,
-          "hidden": False, "backend": None}
+          "hidden": False, "backend": None, "other_until": 0.0}
     BAR_SECONDS = 8.0
 
     def on_click(x: float, y: float) -> None:
@@ -169,7 +173,28 @@ def cmd_run(args) -> int:
 
         buttons = renderer.button_layout(cfg, state, backend.width, backend.height)
         key = renderer.hit_test(buttons, x, y)
-        if key == "view":
+        if key == "other":
+            state["page"] = "dashboard" if state["page"] == "other" else "other"
+            ui["other_until"] = (
+                now + cfg.other_seconds
+                if state["page"] == "other" and cfg.other_seconds else 0.0
+            )
+            # The review page overrides the night wash, so the night wake has
+            # to be extended too -- otherwise the page appears and the wash
+            # comes back over it thirty seconds later.
+            if state["page"] == "other" and renderer.is_night(cfg, now, state["night_mode"]):
+                ui["wake_until"] = now + max(cfg.other_seconds or 180, cfg.night_wake_seconds)
+            elif state["page"] == "dashboard":
+                ui["wake_until"] = 0.0
+        elif key == "refresh":
+            if review_poller is not None:
+                review_poller.refresh_now()
+                # Four Opus calls take a minute or two. The page says
+                # "rewriting…" and picks the answer up on a later poll.
+                ui["other_until"] = now + max(cfg.other_seconds, 180) if cfg.other_seconds else 0.0
+            else:
+                _err("refresh ignored — the daily review is off (review=off)")
+        elif key == "view":
             state["view"] = "minimal" if state["view"] == "full" else "full"
         elif key == "night":
             order = ["auto", "on", "off"]
@@ -220,6 +245,8 @@ def cmd_run(args) -> int:
         try:
             backend.show(renderer.render(
                 cfg, poller.get(), now=now, view=state["view"], state=state,
+                page=state["page"],
+                review=review_poller.get() if review_poller else None,
                 bar=now < ui["bar_until"],
                 hint=clickable and now >= ui["bar_until"],
                 force_day=now < ui["wake_until"],
@@ -252,6 +279,16 @@ def cmd_run(args) -> int:
     # thread, its own much slower interval, and its own failure mode. A pollen
     # outage must never affect the glucose reading, so nothing here is allowed
     # to raise into the render loop.
+    # The daily review, same isolation rule as pollen: its own thread, its own
+    # much slower interval, and no path by which a failure can reach the
+    # glucose render loop.
+    review_poller = None
+    if cfg.review == "on":
+        from .client import ReviewPoller                          # noqa: PLC0415
+        review_poller = ReviewPoller(cfg)
+        review_poller.start()
+        _say(f"review=on (every {cfg.review_minutes} min, OTHER button)")
+
     pollen_poller = None
     if cfg.pollen == "on":
         from .pollen import PollenPoller                        # noqa: PLC0415
@@ -284,6 +321,12 @@ def cmd_run(args) -> int:
 
     def tick() -> None:
         nonlocal last_error
+        # An always-on glucose display should not sit on a page of prose. Hand
+        # the screen back after a while unless other_seconds is 0.
+        if state["page"] == "other" and ui["other_until"] and time.time() > ui["other_until"]:
+            state["page"] = "dashboard"
+            ui["other_until"] = 0.0
+            ui["wake_until"] = 0.0
         snap = poller.get()
         if snap.last_error and snap.last_error != last_error:
             _err(snap.last_error)            # journald gets one line per change,
@@ -316,6 +359,8 @@ def cmd_run(args) -> int:
                 wake.clear()
     finally:
         poller.stop()
+        if review_poller:
+            review_poller.stop()
         if pollen_poller:
             pollen_poller.stop()
         if watcher:
@@ -332,7 +377,8 @@ def cmd_run(args) -> int:
 
 def _apply_overrides(cfg, args) -> None:
     for name in ("units", "low", "high", "hours", "rotate", "backend",
-                 "width", "height", "panel", "night", "palette", "view", "touch"):
+                 "width", "height", "panel", "night", "palette", "view", "touch",
+                 "review"):
         v = getattr(args, name, None)
         if v is not None:
             setattr(cfg, name, v)
@@ -445,6 +491,8 @@ def cmd_probe(_args) -> int:
     _say(f"  geometry     {cfg.width}x{cfg.height} rotate {cfg.rotate}")
     _say(f"  touch        {cfg.touch}")
     _say(f"  view         {cfg.view}")
+    _say(f"  review       {cfg.review}"
+         + (f" (every {cfg.review_minutes} min)" if cfg.review == "on" else ""))
     _say(f"  night        {cfg.night} (mode: {cfg.night_mode})")
 
     if cfg.pollen == "on":
@@ -516,6 +564,16 @@ def cmd_preview(args) -> int:
     img = renderer.render(night_cfg, renderer.demo_snapshot("in_range", now=when), now=when)
     img.save(out / "night.png")
     _say(f"  {out / 'night.png'}  night mode")
+
+    # The OTHER page, with the bar up -- that is how you actually see it, and
+    # the bar is what proves REFRESH and Back are reachable at this panel size.
+    other_state = {"view": "full", "page": "other", "night_mode": "auto", "units": cfg.units}
+    img = renderer.render(
+        cfg, renderer.demo_snapshot("in_range", now=when), now=when,
+        state=other_state, page="other", review=renderer.demo_review(), bar=True,
+    )
+    img.save(out / "other.png")
+    _say(f"  {out / 'other.png'}  the OTHER page (daily review + joke)")
     return 0
 
 
@@ -795,6 +853,8 @@ def _add_display_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--night", help='dim hours, e.g. "22-7", or "off"')
     sp.add_argument("--palette", choices=["clinical", "cvd"])
     sp.add_argument("--view", choices=["full", "minimal"])
+    sp.add_argument("--review", choices=["on", "off"],
+                    help="the OTHER page: the server's daily review and joke")
     sp.add_argument("--touch", help='"auto", "off", or /dev/input/eventN')
 
 

@@ -220,7 +220,13 @@ exists.
 | **VIEW** | Full dashboard ⇄ Minimal — the number at twice the size, for reading across a room |
 | **NIGHT** | Auto / On / Off — see below |
 | **UNITS** | mg/dL ⇄ mmol/L |
+| **Other** | The daily review page — see [section 8](#8-the-other-page--last-nights-review) |
 | **Minimize** | Minimises the window to the taskbar. Click it there to bring it back. |
+
+On the review page the bar changes: **VIEW** becomes **REFRESH**, and **Other**
+becomes **Back**. There is no dashboard on screen to change the view of, and
+five buttons is the most a 3.5" panel can carry and still be hittable with a
+fingertip — about 14mm each, against the ~9mm a finger needs.
 
 The first touch only summons the bar; it never presses whatever happened to be
 under your finger. Reaching out to look at the screen should not change a
@@ -374,7 +380,57 @@ Once installed on the Pi, `sentinelle-display probe` prints the same counts.
 
 ---
 
-## 8. Settings
+## 8. The Other page — last night's review
+
+Press **Other**. The top half is a two-or-three-sentence recommendation for
+tomorrow; the bottom half is that day's type 1 joke.
+
+None of the thinking happens on the Pi. Every evening at 20:00 local — the
+pump's own time zone, falling back to `REVIEW_TZ` — the server runs four agents
+over the previous 24 hours:
+
+| Agent | Reads | Model |
+|---|---|---|
+| 1. Glucose, insulin & carbs | The 24h curve, every bolus, every carb entry, the auto-basal total, your own 14-day baseline | Opus 5 |
+| 2. Apple Health & medication | Sleep, resting HR, HRV, steps, workouts, and any medication logged in Sentinelle with its researched glucose effect | Opus 5 |
+| 3. Best practice | Agents 1 and 2, held against the published consensus targets and the well-established behavioural principles | Opus 5 |
+| 4. The recommendation | All three, plus what kind of day tomorrow is | Opus 5 |
+| The joke | Nothing at all — deliberately never sees your data | Sonnet 5 |
+
+Each agent is its own file under `server/src/coach/agents/`, and each carries
+its own prompt. They share exactly one thing: a single safety block, defined
+once in `agents/types.ts` and prepended to all four, so the guardrails cannot
+drift apart between them. **No agent may state a dose, ratio, correction factor
+or basal change**, in any form. This is an educational tool, not a dosing
+authority.
+
+**Why the evening, and why it asks what day tomorrow is.** The whole point of
+running at 20:00 rather than in the morning is that the advice is for a day that
+has not started yet, and a Saturday does not look like a Tuesday. Agent 4 is
+told explicitly when the day type changes overnight, which makes the Friday and
+Sunday evening runs the two that matter most.
+
+**Refresh** regenerates it on the spot. It returns immediately and the page
+says `rewriting…` — four Opus calls in a chain take a minute or two, and the
+panel picks the answer up on its next poll rather than holding a socket open.
+It is rate limited server-side (10 minutes apart, 8 a day by default): this is a
+button on a wall, and visitors press buttons on walls. The joke is *not*
+regenerated — it belongs to the day, not to the run.
+
+A review that is not from today is drawn dimmed and dated. Yesterday's advice
+shown as if it were tonight's is the one genuinely harmful thing this page
+could do.
+
+The page overrides the night wash, because you only ever reach it by pressing a
+button — you are standing at the panel. It hands the screen back to the glucose
+dashboard after `other_seconds` (three minutes by default).
+
+Turn the whole thing off with `sentinelle-display config --set review=off`, or
+server-side with `COACH_REVIEW=off`.
+
+---
+
+## 9. Settings
 
 ```bash
 sentinelle-display config                       # show everything
@@ -402,6 +458,9 @@ sudo systemctl restart sentinelle-display       # settings apply on restart
 | `allergy_url` | — | Override the endpoint entirely (e.g. an OpenClaw one) |
 | `touch` | `auto` | `auto`, `off`, or a literal `/dev/input/eventN` |
 | `view` | `full` | Which view to start in: `full` or `minimal` |
+| `review` | `on` | The **Other** page: the server's daily review and joke. `off` removes it |
+| `review_minutes` | `15` | How often to refetch the review (it changes once a day) |
+| `other_seconds` | `180` | Hand the screen back to the dashboard after this long on the Other page. `0` stays until you press Back |
 | `night_wake_seconds` | `30` | How long a night-time tap shows the real screen. `0` disables |
 | `width` / `height` | `480` / `320` | The panel's **native** resolution |
 
@@ -424,7 +483,7 @@ red/blue/amber set that separates under all three common types.
 
 ---
 
-## 9. When it does not work
+## 10. When it does not work
 
 Run `sentinelle-display probe` first. It answers most of these.
 
@@ -466,7 +525,7 @@ That split saves an evening.
 
 ---
 
-## 10. What this can and cannot see
+## 11. What this can and cannot see
 
 Pairing produces a **kiosk token**, stored in `~/.config/sentinelle/display.json`
 mode 600. It:
@@ -488,20 +547,25 @@ enumerate valid codes.
 
 ---
 
-## 11. Development
+## 12. Development
 
 The renderer touches no hardware and no network, so you can work on it from a
 laptop:
 
+On a Mac, do it in a venv — Homebrew's Python refuses `pip install` into itself
+(PEP 668), and this needs nothing system-wide:
+
 ```bash
-pip install -e '.[dev]'
-sentinelle-display preview --out ./preview
-sentinelle-display preview --out ./preview --units mmol --rotate 90
-pytest
+python3 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/sentinelle-display preview --out ./preview
+.venv/bin/sentinelle-display preview --out ./preview --units mmol --rotate 90
+.venv/bin/pytest
 ```
 
-That writes `in_range.png`, `low.png`, `high.png`, `stale.png` and `night.png`
-at whatever geometry you ask for.
+That writes `in_range.png`, `low.png`, `high.png`, `stale.png`, `night.png` and
+`other.png` (the review page, with the control bar up) at whatever geometry you
+ask for.
 
 Layout lives in `render.py`, colour in `theme.py`, hardware in `backends/`.
 Adding a controller means one entry in `PANELS` in `backends/spi.py`.

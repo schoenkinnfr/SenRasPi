@@ -40,6 +40,7 @@ Design decisions that are easy to undo by accident, and shouldn't be:
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from .client import Snapshot
+from .client import Review, Snapshot
 from .theme import STALE, Palette, font, palette
 
 REF_W, REF_H = 480, 320
@@ -160,6 +161,12 @@ def _width(draw: ImageDraw.ImageDraw, s: str, f) -> int:
 
 VIEWS = ("full", "minimal")
 
+# The dashboard is one page; the server's daily review is the other. Kept
+# separate from VIEWS rather than added to it because the two answer different
+# questions: `view` is how much of the glucose dashboard to draw, `page` is
+# whether you are looking at the glucose dashboard at all.
+PAGES = ("dashboard", "other")
+
 
 def render(
     cfg,
@@ -171,6 +178,8 @@ def render(
     hint: bool = False,
     force_day: bool = False,
     pollen=None,
+    page: str = "dashboard",
+    review: Review | None = None,
 ) -> Image.Image:
     """The whole screen. Never raises — a renderer that throws leaves a Pi
     showing a frozen frame with no clue why, so failures are drawn instead.
@@ -189,6 +198,12 @@ def render(
     `bar` draws the control bar; `hint` draws the small dotted chip that says
     the bar exists. Both are decided by the caller, because only the caller
     knows whether this output can actually be clicked.
+
+    `page` picks the dashboard or the daily review. The review page is only
+    ever reached by pressing a button, so it deliberately overrides the night
+    wash: someone standing at the panel at 23:30 who has just asked to read
+    tonight's recommendation should get it, not a dim colour field. It is the
+    caller's job to hand the screen back (see cfg.other_seconds).
     """
     now = now or time.time()
     lay = Layout(*_logical_size(cfg))
@@ -200,13 +215,15 @@ def render(
         and minutes_ago is not None
         and minutes_ago > cfg.stale_minutes
     )
-    if not snap.data:
+    # The review page does not depend on there being a glucose reading, and a
+    # Pi that has just been paired should still be able to read it.
+    if not snap.data and page != "other":
         return _render_empty(cfg, lay, snap)
 
     pal = STALE if stale else palette(getattr(cfg, "palette", "clinical"))
 
     state = state or {}
-    if is_night(cfg, now, state.get("night_mode")) and not force_day:
+    if is_night(cfg, now, state.get("night_mode")) and not force_day and page != "other":
         # The bar has to survive the wash. Without this, setting NIGHT to "On"
         # would hide the very control needed to set it back -- a one-way door
         # you could only escape over SSH.
@@ -221,7 +238,9 @@ def render(
     content = Layout(lay.w, lay.h - (lay.px(BAR_H) if bar else 0))
     content.w, content.h = lay.w, lay.h - (lay.px(BAR_H) if bar else 0)
 
-    if view == "minimal":
+    if page == "other":
+        _draw_other(draw, content, pal, cfg, review, now)
+    elif view == "minimal":
         _draw_minimal(draw, content, pal, cfg, d, stale, now)
     else:
         _draw_hero(draw, content, pal, cfg, d, stale)
@@ -238,11 +257,15 @@ def render(
 
     # Drawn LAST so nothing covers the controls.
     if bar:
-        _draw_bar(draw, lay, pal, button_layout(cfg, {**state, "view": view}, lay.w, lay.h))
+        _draw_bar(draw, lay, pal,
+                  button_layout(cfg, {**state, "view": view, "page": page}, lay.w, lay.h))
     elif hint:
         _draw_bar_hint(draw, lay, pal)
 
-    if snap.offline:
+    # The offline banner is about the glucose feed, and on the review page it
+    # would sit on top of the header saying something that page does not claim
+    # anyway -- the review card reports its own connectivity.
+    if snap.offline and page != "other":
         _draw_offline_banner(draw, lay, pal, snap)
 
     return _orient(img, cfg)
@@ -304,12 +327,17 @@ def _orient(img: Image.Image, cfg) -> Image.Image:
 
 
 BAR_H = 44          # reference-space height
-N_BUTTONS = 4
+# Five buttons across a 480px panel is 96px each -- about 14mm on a 3.5"
+# display, still comfortably above the ~9mm a fingertip needs. Six would not
+# be, which is why the OTHER page swaps a button out rather than adding one:
+# while it is up, REFRESH takes VIEW's place (there is no dashboard on screen
+# to change the view of) and OTHER becomes Back.
+N_BUTTONS = 5
 
 
 @dataclass(frozen=True)
 class Button:
-    key: str        # "view" | "night" | "units" | "minimize"
+    key: str        # "view"/"refresh" | "night" | "units" | "other" | "minimize"
     caption: str    # small label above
     value: str      # current state, or the action for minimize
     x0: int
@@ -324,22 +352,34 @@ class Button:
 def button_layout(cfg, state: dict, w: int, h: int) -> list[Button]:
     """The bar's buttons with their real pixel rects, for the CURRENT state.
 
-    `state` carries the live values the buttons reflect: view, night_mode and
-    units. They are passed in rather than read off cfg because the buttons
+    `state` carries the live values the buttons reflect: view, page, night_mode
+    and units. They are passed in rather than read off cfg because the buttons
     change things at runtime without rewriting the config file.
+
+    The set of buttons depends on `page`, so the click handler MUST build this
+    list from the same state it draws with. That is the whole reason geometry
+    and labels live in one function.
     """
     lay = Layout(w, h)
     bar_h = lay.px(BAR_H)
     y0, y1 = h - bar_h, h
-    step = w / N_BUTTONS
 
     night = {"auto": "Auto", "on": "On", "off": "Off"}.get(state.get("night_mode", "auto"), "Auto")
+    on_other = state.get("page") == "other"
+
     specs = [
-        ("view", "VIEW", "Minimal" if state.get("view") == "minimal" else "Full"),
+        # On the review page there is no dashboard to change the view of, so
+        # that slot becomes the one control the page actually needs.
+        ("refresh", "REVIEW", "Refresh") if on_other
+        else ("view", "VIEW", "Minimal" if state.get("view") == "minimal" else "Full"),
         ("night", "NIGHT", night),
         ("units", "UNITS", "mmol/L" if state.get("units") == "mmol" else "mg/dL"),
+        # Labelled with its destination, not with a state: this one is an
+        # action, and "Other" / "Back" is what a finger is looking for.
+        ("other", "", "Back" if on_other else "Other"),
         ("minimize", "", "Minimize"),
     ]
+    step = w / len(specs)
     return [
         Button(key, cap, val, round(i * step), y0, round((i + 1) * step) - 1, y1)
         for i, (key, cap, val) in enumerate(specs)
@@ -504,6 +544,180 @@ def _draw_minimal(draw, lay: Layout, pal: Palette, cfg, d: dict, stale: bool,
     _text(draw, (lay.w // 2, lay.h - lay.px(8)),
           datetime.fromtimestamp(now).strftime("%H:%M"),
           font("regular", lay.pt(11)), pal.ink_3, anchor="ms")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The OTHER page: last night's review on top, the day's joke underneath.
+#
+# Everything on this page is text the server wrote, and text is the one thing a
+# 3.5" panel is bad at. Three rules keep it readable:
+#
+#   - The type size is chosen to fit, not fixed. Two sentences and four
+#     sentences are both possible from the model, and a fixed size means one of
+#     them falls off the bottom of the glass.
+#   - Nothing is ever cut mid-word. If the text genuinely cannot fit at the
+#     smallest size, the last line ends in an ellipsis so it is obvious there
+#     is more, rather than looking like the model stopped talking.
+#   - A review that is not from today is drawn dimmed and dated, the same way a
+#     stale glucose reading is greyed. Yesterday's advice shown as if it were
+#     tonight's is the only genuinely harmful thing this page could do.
+
+
+def _wrap(draw, text: str, f, max_w: int) -> list[str]:
+    """Greedy word wrap. Long unbroken tokens are left to overflow rather than
+    hyphenated -- a URL is more useful whole and slightly clipped than cut in
+    the middle."""
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        cur = ""
+        for word in paragraph.split():
+            trial = f"{cur} {word}".strip()
+            if not cur or _width(draw, trial, f) <= max_w:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        lines.append(cur)
+    return [ln for ln in lines if ln != ""] or [""]
+
+
+def _fit_text(draw, text: str, style: str, sizes, max_w: int, max_h: int, lay: Layout,
+              leading: float = 1.32):
+    """Largest size in `sizes` whose wrapped text fits the box. Falls back to
+    the smallest, truncated with an ellipsis."""
+    f = font(style, lay.pt(sizes[-1]))
+    lines: list[str] = [""]
+    line_h = lay.pt(sizes[-1])
+    for size in sizes:
+        f = font(style, lay.pt(size))
+        line_h = max(1, int(lay.pt(size) * leading))
+        lines = _wrap(draw, text, f, max_w)
+        if len(lines) * line_h <= max_h:
+            return f, lines, line_h
+    keep = max(1, max_h // line_h)
+    if len(lines) > keep:
+        lines = lines[:keep]
+        lines[-1] = lines[-1].rstrip(" .,;:") + "…"
+    return f, lines, line_h
+
+
+def _review_state(cfg, review) -> tuple[str, str]:
+    """(kind, message) — what this page should be saying right now.
+
+    kind is one of: "ok", "off", "waiting", "error". Split out from the drawing
+    so the decision is testable without a framebuffer.
+    """
+    if getattr(cfg, "review", "on") != "on" or review is None:
+        return "off", "The daily review is switched off for this display."
+    if review.data is None:
+        return "error", review.last_error or "waiting for the server"
+    if not review.data.get("ok"):
+        if not review.data.get("configured", True):
+            return "off", "No AI provider is configured on the server."
+        return "waiting", review.data.get("message") or "No review yet."
+    if not review.recommendation:
+        return "waiting", review.data.get("error") or "The review has not finished yet."
+    return "ok", ""
+
+
+def _local_hhmm(iso: str | None) -> str | None:
+    """Server timestamps arrive as ISO 8601 with a Z. Python 3.9's parser does
+    not accept the Z, and a display that crashes on a timestamp is worse than
+    one that omits it."""
+    if not iso:
+        return None
+    try:
+        txt = str(iso).replace("Z", "+00:00")
+        # Trim over-long fractional seconds (Postgres/Node can emit either).
+        txt = re.sub(r"\.(\d{6})\d+", r".\1", txt)
+        return datetime.fromisoformat(txt).astimezone().strftime("%H:%M")
+    except (ValueError, TypeError):
+        return None
+
+
+def _draw_other(draw, lay: Layout, pal: Palette, cfg, review, now: float) -> None:
+    x0 = lay.px(16)
+    x1 = lay.w - lay.px(16)
+    box_w = x1 - x0
+
+    kind, message = _review_state(cfg, review)
+    data = (review.data or {}) if review is not None else {}
+    from_today = bool(data.get("is_today")) if kind == "ok" else True
+    generating = bool(getattr(review, "generating", False))
+
+    # ---- header --------------------------------------------------------------
+    f_cap = font("regular", lay.pt(11))
+    f_head = font("bold", lay.pt(15))
+
+    next_type = data.get("next_day_type")
+    title = "FOR TOMORROW" + (f" · {str(next_type).upper()}" if next_type else "")
+    _text(draw, (x0, lay.px(8)), title, f_cap, pal.ink_3)
+
+    # Right-hand status chip. Only one thing can be the most important, so
+    # these are deliberately ordered: something happening now beats something
+    # being old, which beats a timestamp nobody needed.
+    if generating:
+        chip, chip_col = "rewriting…", pal.accent
+    elif kind == "ok" and not from_today:
+        chip, chip_col = f"from {data.get('day', 'an earlier day')}", pal.high
+    else:
+        at = _local_hhmm(data.get("generated_at"))
+        chip, chip_col = (f"{at}" if at else ""), pal.ink_3
+    if chip:
+        _text(draw, (x1, lay.px(8)), chip, f_cap, chip_col, anchor="ra")
+
+    rule_y = lay.px(26)
+    draw.line([(x0, rule_y), (x1, rule_y)], fill=pal.rule, width=lay.px(1))
+
+    # ---- top half: the recommendation ---------------------------------------
+    top = rule_y + lay.px(12)
+    split = int(lay.h * 0.58)
+    rec_h = split - top - lay.px(10)
+
+    if kind == "ok":
+        body = review.recommendation or ""
+        colour = pal.ink if from_today else pal.ink_3
+        f, lines, line_h = _fit_text(draw, body, "regular", (19, 17, 15, 14, 13, 12, 11),
+                                     box_w, rec_h, lay)
+    else:
+        body = message
+        colour = pal.high if kind == "error" else pal.ink_3
+        f, lines, line_h = _fit_text(draw, body, "regular", (15, 14, 13, 12, 11),
+                                     box_w, rec_h, lay)
+
+    y = top
+    for line in lines:
+        _text(draw, (x0, y), line, f, colour)
+        y += line_h
+
+    # A day the server could partly not analyse still shows its recommendation;
+    # the note says the picture is incomplete rather than hiding the text.
+    if kind == "ok" and data.get("error"):
+        _text(draw, (x0, split - lay.px(14)), str(data["error"])[:52], f_cap, pal.high)
+
+    # ---- bottom half: the joke ----------------------------------------------
+    div_y = split
+    _dashed_h(draw, x0, x1, div_y, pal.rule, lay.px(1), dash=lay.px(4))
+
+    joke = data.get("joke") if kind == "ok" or data.get("joke") else None
+    label_y = div_y + lay.px(10)
+    _text(draw, (x0, label_y), "AND, FOR WHAT IT'S WORTH", f_cap, pal.ink_3)
+
+    joke_top = label_y + lay.px(18)
+    joke_h = lay.h - joke_top - lay.px(10)
+    if joke:
+        fj, jlines, jline_h = _fit_text(draw, str(joke), "regular", (16, 15, 14, 13, 12, 11),
+                                        box_w, joke_h, lay)
+        # Centred in its half rather than pinned under the label: a one-line
+        # joke top-aligned leaves a band of empty panel that reads as a
+        # rendering fault rather than as a short joke.
+        jy = joke_top + max(0, (joke_h - len(jlines) * jline_h) // 2)
+        for line in jlines:
+            _text(draw, (x0, jy), line, fj, pal.ink_2)
+            jy += jline_h
+    else:
+        _text(draw, (x0, joke_top), "No joke today. Tragic, in its way.",
+              font("regular", lay.pt(13)), pal.ink_3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -958,6 +1172,48 @@ def _dashed_h(draw, x0: int, x1: int, y: float, colour, width: int, dash: int = 
     while x < x1:
         draw.line([(x, y), (min(x + dash, x1), y)], fill=colour, width=width)
         x += dash * 2
+
+
+def demo_review(kind: str = "ok") -> Review:
+    """Canned review data for `preview` and the tests.
+
+    The sample recommendation is deliberately at the long end of what agent 4
+    is allowed to produce -- three full sentences -- because the layout only
+    goes wrong at the top of the range, and a preview built from a short one
+    would look fine right up until the evening it mattered.
+    """
+    if kind == "waiting":
+        return Review(ok=True, data={"ok": False, "configured": True,
+                                     "message": "No review yet — the first one runs this evening."},
+                      fetched_at=time.time())
+    if kind == "error":
+        return Review(ok=False, data=None, fetched_at=time.time(),
+                      last_error="offline — cannot reach the server")
+    return Review(
+        ok=True,
+        fetched_at=time.time(),
+        data={
+            "ok": True,
+            "generating": False,
+            "day": datetime.now().strftime("%Y-%m-%d"),
+            "is_today": True,
+            "day_type": "weekday",
+            "next_day_type": "weekend",
+            "recommendation": (
+                "Dinner ran you up to 14.2 for nearly three hours last night, and it "
+                "came after the only day this week with no walk in it. Tomorrow is a "
+                "Saturday, so the long morning you usually take will do more of that "
+                "work for you — keep something fast-acting in your pocket for it."
+            ),
+            "joke": (
+                "My sensor lasted the entire holiday. It failed in the taxi home, "
+                "which I think we can all agree is just spite."
+            ),
+            "error": None,
+            "generated_at": None,
+            "refresh": {"count": 0, "remaining": 8, "wait_minutes": 0},
+        },
+    )
 
 
 def demo_snapshot(kind: str = "in_range", now: float | None = None) -> Snapshot:
